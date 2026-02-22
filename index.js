@@ -23,7 +23,15 @@ app.use(cors({
 app.use(express.json({ limit: '10kb' }));
 
 app.use((req, res, next) => {
-    console.log(`[${new Date().toISOString()}] ${req.method} ${req.path}`);
+    const timestamp = new Date().toISOString();
+    console.log(`[${timestamp}] ${req.method} ${req.path}`);
+    if (req.method === 'POST' || req.method === 'PUT') {
+        const bodyCopy = { ...req.body };
+        // Ocultar dados sensíveis nos logs
+        if (bodyCopy.password) bodyCopy.password = '***';
+        if (bodyCopy.credentials) bodyCopy.credentials = '***';
+        console.log(`[${timestamp}] Body:`, JSON.stringify(bodyCopy));
+    }
     next();
 });
 

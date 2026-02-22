@@ -85,7 +85,10 @@ const verifyAuth = async (req, res, next) => {
         }
 
         const idToken = authHeader.split('Bearer ')[1];
+        console.log('[Auth] Token recebido (prefixo):', idToken.substring(0, 15) + '...');
+
         const decodedToken = await admin.auth().verifyIdToken(idToken);
+        console.log('[Auth] Token validado para UID:', decodedToken.uid);
 
         req.user = decodedToken;
         next();
