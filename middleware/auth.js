@@ -4,8 +4,16 @@ const admin = require('firebase-admin');
 let isInitialized = false;
 
 try {
+    const requiredVars = [
+        'FIREBASE_PROJECT_ID',
+        'FIREBASE_PRIVATE_KEY',
+        'FIREBASE_CLIENT_EMAIL'
+    ];
+
+    const missingVars = requiredVars.filter(v => !process.env[v]);
+
     // 1. Try individual environment variables (Railway Manual Entry) - HIGHEST PRIORITY
-    if (process.env.FIREBASE_PROJECT_ID && process.env.FIREBASE_PRIVATE_KEY) {
+    if (missingVars.length === 0) {
         const serviceAccount = {
             type: process.env.FIREBASE_TYPE || 'service_account',
             project_id: process.env.FIREBASE_PROJECT_ID,
@@ -37,23 +45,21 @@ try {
         isInitialized = true;
         console.log('[Auth] Firebase Admin initialized via Base64 env var');
     }
-    // 3. Try default Application Default Credentials
-    else if (process.env.GOOGLE_APPLICATION_CREDENTIALS && !process.env.FIREBASE_PROJECT_ID) {
-        admin.initializeApp();
-        isInitialized = true;
-        console.log('[Auth] Firebase Admin initialized via GOOGLE_APPLICATION_CREDENTIALS');
-    }
-    // 3. Try to find 'serviceAccountKey.json' in server root (Dev convenience)
+    // 3. Diagnostics / Fallback
     else {
+        if (missingVars.length > 0 && missingVars.length < requiredVars.length) {
+            console.warn('[Auth] Missing some Firebase vars:', missingVars.join(', '));
+        }
+
         try {
             const serviceAccount = require('../serviceAccountKey.json');
             admin.initializeApp({
                 credential: admin.credential.cert(serviceAccount)
             });
             isInitialized = true;
-            console.log('[Auth] Firebase Admin initialized via serviceAccountKey.json');
+            console.log('[Auth] Firebase Admin initialized via local serviceAccountKey.json');
         } catch (ignored) {
-            console.warn('[Auth] No serviceAccountKey.json found and no env vars set.');
+            console.warn('[Auth] Firebase not configured (No JSON and missing env vars)');
         }
     }
 } catch (e) {
