@@ -5,6 +5,8 @@ const pluggyRoutes = require('./api/pluggy');
 
 const app = express();
 const PORT = process.env.PORT || 3001;
+console.log('[Server] PORT from env:', process.env.PORT);
+console.log('[Server] Using PORT:', PORT);
 const { limiter, securityHeaders } = require('./middleware/security');
 
 // Security Middleware
