@@ -4,24 +4,13 @@ const admin = require('firebase-admin');
 let isInitialized = false;
 
 try {
-    // 1. Try environment variable (Base64 JSON)
-    if (process.env.FIREBASE_SERVICE_ACCOUNT) {
-        const serviceAccount = JSON.parse(
-            Buffer.from(process.env.FIREBASE_SERVICE_ACCOUNT, 'base64').toString('ascii')
-        );
-        admin.initializeApp({
-            credential: admin.credential.cert(serviceAccount)
-        });
-        isInitialized = true;
-        console.log('[Auth] Firebase Admin initialized via Base64 env var');
-    }
-    // 2. Try individual environment variables (Railway Manual Entry)
-    else if (process.env.FIREBASE_PROJECT_ID && process.env.FIREBASE_PRIVATE_KEY) {
+    // 1. Try individual environment variables (Railway Manual Entry) - HIGHEST PRIORITY
+    if (process.env.FIREBASE_PROJECT_ID && process.env.FIREBASE_PRIVATE_KEY) {
         const serviceAccount = {
             type: process.env.FIREBASE_TYPE || 'service_account',
             project_id: process.env.FIREBASE_PROJECT_ID,
             private_key_id: process.env.FIREBASE_PRIVATE_KEY_ID,
-            private_key: process.env.FIREBASE_PRIVATE_KEY.replace(/\\n/g, '\n'),
+            private_key: process.env.FIREBASE_PRIVATE_KEY.replace(/\\n/g, '\n').replace(/"/g, ''),
             client_email: process.env.FIREBASE_CLIENT_EMAIL,
             client_id: process.env.FIREBASE_CLIENT_ID,
             auth_uri: process.env.FIREBASE_AUTH_URI || 'https://accounts.google.com/o/oauth2/auth',
@@ -37,8 +26,19 @@ try {
         isInitialized = true;
         console.log('[Auth] Firebase Admin initialized via individual env vars');
     }
+    // 2. Try environment variable (Base64 JSON)
+    else if (process.env.FIREBASE_SERVICE_ACCOUNT) {
+        const serviceAccount = JSON.parse(
+            Buffer.from(process.env.FIREBASE_SERVICE_ACCOUNT, 'base64').toString('ascii')
+        );
+        admin.initializeApp({
+            credential: admin.credential.cert(serviceAccount)
+        });
+        isInitialized = true;
+        console.log('[Auth] Firebase Admin initialized via Base64 env var');
+    }
     // 3. Try default Application Default Credentials
-    else if (process.env.GOOGLE_APPLICATION_CREDENTIALS) {
+    else if (process.env.GOOGLE_APPLICATION_CREDENTIALS && !process.env.FIREBASE_PROJECT_ID) {
         admin.initializeApp();
         isInitialized = true;
         console.log('[Auth] Firebase Admin initialized via GOOGLE_APPLICATION_CREDENTIALS');
