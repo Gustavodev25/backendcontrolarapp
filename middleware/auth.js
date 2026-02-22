@@ -62,9 +62,14 @@ try {
 }
 
 const verifyAuth = async (req, res, next) => {
+    console.log('[Auth] Verificando autenticação...');
+    console.log('[Auth] Path:', req.path);
+    console.log('[Auth] Method:', req.method);
+    
     // If not initialized, everything fails (Fail Secure)
     // Unless in explicit Development Bypass Mode (not recommended)
     if (!isInitialized) {
+        console.error('[Auth] Firebase Admin não inicializado!');
         if (process.env.NODE_ENV === 'development') {
             // console.warn('[Auth] WARNING: Bypassing auth check because Admin SDK is not configured (Dev Mode)');
             // return next(); // Uncomment to allow dev without auth (Insecure)
@@ -80,7 +85,10 @@ const verifyAuth = async (req, res, next) => {
 
     try {
         const authHeader = req.headers.authorization;
+        console.log('[Auth] Authorization header presente:', !!authHeader);
+        
         if (!authHeader || !authHeader.startsWith('Bearer ')) {
+            console.warn('[Auth] Token não fornecido ou formato inválido');
             return res.status(401).json({ success: false, error: 'Token de autenticação não fornecido' });
         }
 
@@ -88,12 +96,13 @@ const verifyAuth = async (req, res, next) => {
         console.log('[Auth] Token recebido (prefixo):', idToken.substring(0, 15) + '...');
 
         const decodedToken = await admin.auth().verifyIdToken(idToken);
-        console.log('[Auth] Token validado para UID:', decodedToken.uid);
+        console.log('[Auth] ✅ Token validado para UID:', decodedToken.uid);
 
         req.user = decodedToken;
         next();
     } catch (error) {
-        console.error('[Auth] Verification failed:', error.code || error.message);
+        console.error('[Auth] ❌ Verification failed:', error.code || error.message);
+        console.error('[Auth] Error details:', error);
 
         if (error.code === 'auth/id-token-expired') {
             return res.status(403).json({ success: false, error: 'Token expirado', code: 'auth/token-expired' });

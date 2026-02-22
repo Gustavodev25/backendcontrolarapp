@@ -27,6 +27,11 @@ app.use(express.json({ limit: '10kb' }));
 app.use((req, res, next) => {
     const timestamp = new Date().toISOString();
     console.log(`[${timestamp}] ${req.method} ${req.path}`);
+    console.log(`[${timestamp}] Headers:`, JSON.stringify({
+        authorization: req.headers.authorization ? 'Bearer ***' : 'none',
+        'content-type': req.headers['content-type'],
+        origin: req.headers.origin
+    }));
     if (req.method === 'POST' || req.method === 'PUT') {
         const bodyCopy = { ...req.body };
         // Ocultar dados sensíveis nos logs
@@ -79,10 +84,16 @@ app.use('/api/pluggy', pluggyRoutes);
 app.use('/api/asaas', require('./api/asaas'));
 
 app.use((err, req, res, next) => {
-    console.error('[Error]', err);
+    const timestamp = new Date().toISOString();
+    console.error(`[${timestamp}] ❌ ERROR:`, err.message);
+    console.error(`[${timestamp}] Stack:`, err.stack);
+    console.error(`[${timestamp}] Path:`, req.path);
+    console.error(`[${timestamp}] Method:`, req.method);
+    
     res.status(500).json({
         success: false,
-        error: err.message || 'Internal server error'
+        error: err.message || 'Internal server error',
+        path: req.path
     });
 });
 
