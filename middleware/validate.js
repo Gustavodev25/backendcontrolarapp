@@ -6,8 +6,11 @@ const { z } = require('zod');
  */
 const validate = (schema) => (req, res, next) => {
     try {
-        // Get the shape of the schema (works with Zod 3.x)
-        const shape = schema.shape || (typeof schema._def?.shape === 'function' ? schema._def.shape() : schema._def?.shape) || {};
+        // Resolve object schema shape for wrapper detection.
+        const shape =
+            schema.shape ||
+            (typeof schema._def?.shape === 'function' ? schema._def.shape() : schema._def?.shape) ||
+            {};
 
         // Check if this is a wrapper schema with body/query/params
         const hasBodyWrapper = 'body' in shape;
@@ -30,17 +33,21 @@ const validate = (schema) => (req, res, next) => {
         next();
     } catch (err) {
         if (err instanceof z.ZodError) {
-            console.warn('[Validation] Invalid request:', req.path, JSON.stringify(err.errors));
+            // Zod v4 uses `issues`; older code may still expose `errors`.
+            const issues = Array.isArray(err.issues) ? err.issues : (Array.isArray(err.errors) ? err.errors : []);
+
+            console.warn('[Validation] Invalid request:', req.path, JSON.stringify(issues));
             return res.status(400).json({
                 success: false,
-                error: 'Dados inválidos',
-                details: err.errors.map(e => ({
+                error: 'Dados invalidos',
+                details: issues.map((e) => ({
                     path: e.path.join('.'),
                     code: e.code,
                     message: e.message
                 }))
             });
         }
+
         next(err);
     }
 };
