@@ -378,4 +378,40 @@ router.post('/update-item/:id', ensureUserMatch, async (req, res) => {
     }
 });
 
+// ==========================================
+// OAUTH CALLBACK ENDPOINT
+// ==========================================
+router.get('/oauth-callback', async (req, res) => {
+    try {
+        // O Pluggy pode enviar parâmetros como itemId, status, etc.
+        const { itemId, status, error } = req.query;
+        
+        console.log('[OAuth Callback] Received:', { itemId, status, error });
+        
+        // Redirecionar de volta para o app usando deep link
+        const deepLink = `controlarapp://open-finance/callback?itemId=${itemId || ''}&status=${status || ''}&error=${error || ''}`;
+        
+        // Retornar HTML que redireciona automaticamente
+        res.send(`
+            <!DOCTYPE html>
+            <html>
+            <head>
+                <meta charset="UTF-8">
+                <title>Redirecionando...</title>
+                <meta http-equiv="refresh" content="0;url=${deepLink}">
+            </head>
+            <body>
+                <p>Redirecionando de volta para o app...</p>
+                <script>
+                    window.location.href = '${deepLink}';
+                </script>
+            </body>
+            </html>
+        `);
+    } catch (error) {
+        console.error('[OAuth Callback] Error:', error);
+        res.status(500).send('Erro ao processar callback');
+    }
+});
+
 module.exports = router;
