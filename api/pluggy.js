@@ -241,7 +241,15 @@ router.post('/create-item', validate(createItemSchema), ensureUserMatch, async (
             });
         }
 
-        const oauthUrl = data.parameter?.oauthUrl || data.oauthUrl || data.userAction?.url;
+        const oauthUrl = data.parameter?.oauthUrl || data.oauthUrl || data.userAction?.url || data.userAction?.attributes?.url;
+
+        console.log('[Pluggy] Item criado:', data.id, 'Status:', data.status);
+        if (oauthUrl) {
+            console.log('[Pluggy] Link de redirecionamento (OAuth) encontrado:', oauthUrl);
+        } else {
+            console.warn('[Pluggy] AVISO: Nenhum link de redirecionamento encontrado na resposta:', JSON.stringify(data));
+        }
+
         res.json({ success: true, item: data, oauthUrl });
     } catch (error) {
         console.error('[Pluggy] Create item error:', error.message);
