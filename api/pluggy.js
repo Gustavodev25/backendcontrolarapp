@@ -35,6 +35,11 @@ const paramIdSchema = z.object({
     id: z.string().uuid('ID inválido')
 });
 
+// Wrapper schema para rotas que validam apenas params
+const paramIdWrapperSchema = z.object({
+    params: paramIdSchema
+});
+
 // ==========================================
 // MIDDLEWARES E SEGURANÇA FINTECH
 // ==========================================
@@ -265,7 +270,7 @@ router.post('/create-item', validate(createItemSchema), async (req, res) => {
     }
 });
 
-router.get('/items/:id', validate({ params: paramIdSchema }), async (req, res) => {
+router.get('/items/:id', validate(paramIdWrapperSchema), async (req, res) => {
     try {
         const token = await getAccessToken();
         const response = await safeFetch(`${PLUGGY_API_URL}/items/${req.params.id}`, { headers: { 'X-API-KEY': token } });
@@ -318,7 +323,7 @@ router.post('/sync', validate(syncSchema), async (req, res) => {
     }
 });
 
-router.delete('/items/:id', validate({ params: paramIdSchema }), async (req, res) => {
+router.delete('/items/:id', validate(paramIdWrapperSchema), async (req, res) => {
     try {
         const token = await getAccessToken();
         const response = await safeFetch(`${PLUGGY_API_URL}/items/${req.params.id}`, { method: 'DELETE', headers: { 'X-API-KEY': token } });
@@ -329,7 +334,7 @@ router.delete('/items/:id', validate({ params: paramIdSchema }), async (req, res
     }
 });
 
-router.post('/update-item/:id', validate({ params: paramIdSchema }), async (req, res) => {
+router.post('/update-item/:id', validate(paramIdWrapperSchema), async (req, res) => {
     try {
         const token = await getAccessToken();
         const response = await safeFetch(`${PLUGGY_API_URL}/items/${req.params.id}`, {
