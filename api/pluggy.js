@@ -88,6 +88,12 @@ const MAX_TRANSACTION_PAGES = 50;
 const FETCH_TIMEOUT_MS = 45000;
 const MAX_CONCURRENT_REQUESTS = 3;
 
+// Sync polling config
+const SYNC_POLL_INTERVAL_MS = 3000;       // Intervalo entre cada poll
+const SYNC_POLL_MAX_ATTEMPTS = 60;        // Máximo de tentativas (60 * 3s = 3 min)
+const SYNC_INITIAL_WAIT_MS = 2000;        // Espera inicial antes do primeiro poll
+const ITEM_TERMINAL_STATUSES = ['UPDATED', 'LOGIN_ERROR', 'OUTDATED', 'ERROR'];
+
 // ==========================================
 // UTILS DE REDE E CONCORRÊNCIA
 // ==========================================
@@ -205,6 +211,131 @@ const fetchTransactionsForAccount = async (token, accountId, fromDate) => {
     return transactions;
 };
 
+// ==========================================
+// HELPER: Aguardar atualização do Item Pluggy
+// ==========================================
+/**
+ * Dispara um PATCH no item Pluggy para forçar re-extração de dados
+ * do banco real, e faz polling até o status ser terminal.
+ * Retorna o item atualizado ou lança erro se falhar.
+ */
+const waitForItemUpdate = async (token, itemId) => {
+    console.info(`[Sync] 🔄 Disparando atualização real para item ${itemId}...`);
+
+    // 1. Verifica status atual do item antes de disparar PATCH
+    const preCheckResponse = await safeFetch(`${PLUGGY_API_URL}/items/${itemId}`, {
+        headers: { 'X-API-KEY': token }
+    });
+    if (!preCheckResponse.ok) {
+        throw new Error(`Item ${itemId} não encontrado (HTTP ${preCheckResponse.status})`);
+    }
+    const preItem = await preCheckResponse.json();
+    console.info(`[Sync] 📋 Status atual do item: ${preItem.status} | Última execução: ${preItem.lastUpdatedAt || preItem.executionStatus || 'N/A'}`);
+
+    // Se o item já está atualizando, não disparamos outro PATCH
+    if (preItem.status === 'UPDATING') {
+        console.info(`[Sync] ⏳ Item já está atualizando. Aguardando conclusão...`);
+    } else {
+        // 2. Dispara PATCH para forçar nova extração de dados do banco
+        try {
+            const patchResponse = await safeFetch(`${PLUGGY_API_URL}/items/${itemId}`, {
+                method: 'PATCH',
+                headers: {
+                    'Content-Type': 'application/json',
+                    'X-API-KEY': token
+                },
+                body: JSON.stringify({})
+            });
+
+            if (!patchResponse.ok) {
+                const patchError = await patchResponse.json().catch(() => ({}));
+                const errorDesc = patchError.codeDescription || patchError.message || `HTTP ${patchResponse.status}`;
+
+                // Se o item já está atualizando (race condition), continue com polling
+                if (errorDesc === 'ITEM_IS_ALREADY_UPDATING' || patchResponse.status === 400) {
+                    console.warn(`[Sync] ⚠️ Item já em atualização (${errorDesc}). Aguardando...`);
+                } else {
+                    throw new Error(`Falha ao disparar atualização: ${errorDesc}`);
+                }
+            } else {
+                const patchResult = await patchResponse.json();
+                console.info(`[Sync] ✅ PATCH disparado com sucesso. Novo status: ${patchResult.status}`);
+            }
+        } catch (patchErr) {
+            // Se a mensagem contém "already updating", continua
+            if (patchErr.message && patchErr.message.includes('already')) {
+                console.warn(`[Sync] ⚠️ Item já em atualização. Prosseguindo com polling...`);
+            } else {
+                throw patchErr;
+            }
+        }
+    }
+
+    // 3. Polling: esperar o item chegar a um status terminal
+    console.info(`[Sync] ⏳ Iniciando polling de status (max ${SYNC_POLL_MAX_ATTEMPTS} tentativas, intervalo ${SYNC_POLL_INTERVAL_MS}ms)...`);
+    await delay(SYNC_INITIAL_WAIT_MS);
+
+    for (let attempt = 1; attempt <= SYNC_POLL_MAX_ATTEMPTS; attempt++) {
+        try {
+            const pollResponse = await safeFetch(`${PLUGGY_API_URL}/items/${itemId}`, {
+                headers: { 'X-API-KEY': token }
+            });
+
+            if (!pollResponse.ok) {
+                console.warn(`[Sync] ⚠️ Poll attempt ${attempt}: HTTP ${pollResponse.status}`);
+                await delay(SYNC_POLL_INTERVAL_MS);
+                continue;
+            }
+
+            const pollItem = await pollResponse.json();
+            const status = pollItem.status;
+
+            if (attempt % 5 === 0 || ITEM_TERMINAL_STATUSES.includes(status)) {
+                console.info(`[Sync] 🔍 Poll #${attempt}: status=${status}`);
+            }
+
+            if (ITEM_TERMINAL_STATUSES.includes(status)) {
+                // Status terminal alcançado
+                if (status === 'UPDATED') {
+                    console.info(`[Sync] ✅ Item atualizado com sucesso após ${attempt} tentativas!`);
+                    return pollItem;
+                }
+
+                // Erros de autenticação/conexão
+                const errorInfo = pollItem.error || pollItem.executionErrorResult || {};
+                const errorMessage = errorInfo.message || errorInfo.description || status;
+
+                if (status === 'LOGIN_ERROR') {
+                    console.error(`[Sync] ❌ Erro de login bancário: ${errorMessage}`);
+                    throw new Error(`BANK_LOGIN_ERROR: Credenciais bancárias expiradas ou inválidas. Reconecte sua conta. Detalhe: ${errorMessage}`);
+                }
+
+                if (status === 'OUTDATED') {
+                    console.error(`[Sync] ❌ Conexão bancária expirada: ${errorMessage}`);
+                    throw new Error(`BANK_OUTDATED: Conexão com o banco expirou. É necessário reconectar a conta bancária.`);
+                }
+
+                if (status === 'ERROR') {
+                    console.error(`[Sync] ❌ Erro do banco: ${errorMessage}`);
+                    throw new Error(`BANK_ERROR: O banco retornou um erro durante a atualização. Detalhe: ${errorMessage}`);
+                }
+            }
+        } catch (pollError) {
+            // Se é um erro que lançamos propositalmente, propaga
+            if (pollError.message && (pollError.message.startsWith('BANK_') || pollError.message.includes('Falha ao disparar'))) {
+                throw pollError;
+            }
+            console.warn(`[Sync] ⚠️ Erro no poll #${attempt}: ${pollError.message}`);
+        }
+
+        await delay(SYNC_POLL_INTERVAL_MS);
+    }
+
+    // Timeout - o item não chegou a um status terminal
+    console.error(`[Sync] ⏰ Timeout: item ${itemId} não finalizou após ${SYNC_POLL_MAX_ATTEMPTS} tentativas`);
+    throw new Error(`SYNC_TIMEOUT: O banco demorou muito para responder. Tente novamente em alguns minutos.`);
+};
+
 router.get('/connectors', async (req, res) => {
     try {
         const token = await getAccessToken();
@@ -275,44 +406,118 @@ router.get('/items/:id', validate(paramIdWrapperSchema), async (req, res) => {
 });
 
 router.post('/sync', validate(syncSchema), async (req, res) => {
+    const syncStartTime = Date.now();
+    const { itemId, from } = req.body;
+    const fromDate = typeof from === 'string' && from.trim() ? from.trim() : null;
+
+    console.info(`\n[Sync] ========================================`);
+    console.info(`[Sync] 🚀 Nova sincronização iniciada`);
+    console.info(`[Sync]    Item: ${itemId}`);
+    console.info(`[Sync]    From: ${fromDate || '(sem filtro de data - buscar tudo)'}`);
+    console.info(`[Sync]    Hora: ${new Date().toISOString()}`);
+    console.info(`[Sync] ========================================`);
+
     try {
-        const { itemId, from } = req.body;
-        const fromDate = typeof from === 'string' && from.trim() ? from.trim() : null;
         const token = await getAccessToken();
+        console.info(`[Sync] 🔑 Token de acesso obtido`);
 
-        const itemResponse = await safeFetch(`${PLUGGY_API_URL}/items/${itemId}`, { headers: { 'X-API-KEY': token } });
-        if (!itemResponse.ok) throw new Error(`Item não encontrado`);
-        const item = await itemResponse.json();
+        // ============ PASSO 1: Disparar atualização real e aguardar ============
+        const updatedItem = await waitForItemUpdate(token, itemId);
+        const updateDuration = ((Date.now() - syncStartTime) / 1000).toFixed(1);
+        console.info(`[Sync] ✅ Atualização concluída em ${updateDuration}s`);
 
-        const accountsResponse = await safeFetch(`${PLUGGY_API_URL}/accounts?itemId=${itemId}`, { headers: { 'X-API-KEY': token } });
-        if (!accountsResponse.ok) throw new Error('Falha ao buscar contas');
+        // ============ PASSO 2: Buscar contas atualizadas ============
+        console.info(`[Sync] 📂 Buscando contas do item...`);
+        const accountsResponse = await safeFetch(`${PLUGGY_API_URL}/accounts?itemId=${itemId}`, {
+            headers: { 'X-API-KEY': token }
+        });
+        if (!accountsResponse.ok) {
+            console.error(`[Sync] ❌ Falha ao buscar contas: HTTP ${accountsResponse.status}`);
+            throw new Error('Falha ao buscar contas após atualização');
+        }
         const accountsData = await accountsResponse.json();
+        const accountsList = accountsData.results || [];
+        console.info(`[Sync] 📂 ${accountsList.length} conta(s) encontrada(s)`);
 
-        const tasks = (accountsData.results || []).map(account => async () => {
+        // ============ PASSO 3: Buscar transações e faturas para cada conta ============
+        const tasks = accountsList.map(account => async () => {
             account.itemId = itemId;
-            if (!account.connector && item.connector) account.connector = item.connector;
+            if (!account.connector && updatedItem.connector) account.connector = updatedItem.connector;
+
+            console.info(`[Sync] 💳 Buscando dados da conta: ${account.name || account.id} (tipo: ${account.type})`);
 
             const [transactions, billsData] = await Promise.all([
-                fetchTransactionsForAccount(token, account.id, fromDate).catch(() => []),
+                fetchTransactionsForAccount(token, account.id, fromDate).catch(err => {
+                    console.error(`[Sync] ❌ Erro ao buscar transações da conta ${account.id}: ${err.message}`);
+                    return [];
+                }),
                 account.type === 'CREDIT'
                     ? safeFetch(`${PLUGGY_API_URL}/accounts/${account.id}/bills`, { headers: { 'X-API-KEY': token } })
-                        .then(res => res.ok ? res.json() : { results: [] }).catch(() => ({ results: [] }))
+                        .then(r => r.ok ? r.json() : { results: [] }).catch(err => {
+                            console.error(`[Sync] ❌ Erro ao buscar faturas da conta ${account.id}: ${err.message}`);
+                            return { results: [] };
+                        })
                     : Promise.resolve({ results: [] })
             ]);
 
             account.transactions = transactions || [];
             account.bills = billsData?.results || [];
+
+            console.info(`[Sync]    ✅ Conta ${account.name || account.id}: ${account.transactions.length} transações, ${account.bills.length} faturas`);
             return account;
         });
 
         const accountsWithTransactions = await runWithConcurrencyLimit(tasks, MAX_CONCURRENT_REQUESTS);
-        const connector = accountsWithTransactions.find(acc => acc?.connector)?.connector || item.connector || null;
+        const connector = accountsWithTransactions.find(acc => acc?.connector)?.connector || updatedItem.connector || null;
+
+        // ============ PASSO 4: Resumo final ============
+        const totalTransactions = accountsWithTransactions.reduce((sum, acc) => sum + (acc.transactions?.length || 0), 0);
+        const totalBills = accountsWithTransactions.reduce((sum, acc) => sum + (acc.bills?.length || 0), 0);
+        const totalDuration = ((Date.now() - syncStartTime) / 1000).toFixed(1);
+
+        console.info(`[Sync] ========================================`);
+        console.info(`[Sync] 🏁 Sincronização concluída!`);
+        console.info(`[Sync]    Contas: ${accountsWithTransactions.length}`);
+        console.info(`[Sync]    Transações: ${totalTransactions}`);
+        console.info(`[Sync]    Faturas: ${totalBills}`);
+        console.info(`[Sync]    Duração total: ${totalDuration}s`);
+        console.info(`[Sync] ========================================\n`);
 
         return res.json({
-            success: true, item: item, connector: connector, accounts: accountsWithTransactions, syncedAt: new Date().toISOString()
+            success: true,
+            item: updatedItem,
+            connector: connector,
+            accounts: accountsWithTransactions,
+            syncedAt: new Date().toISOString()
         });
     } catch (error) {
-        return res.status(500).json({ success: false, error: 'Erro durante a sincronização de dados bancários.' });
+        const totalDuration = ((Date.now() - syncStartTime) / 1000).toFixed(1);
+        console.error(`[Sync] ❌ ERRO na sincronização (${totalDuration}s): ${error.message}`);
+
+        // Mapear erros específicos para mensagens amigáveis
+        let userMessage = 'Erro durante a sincronização de dados bancários.';
+        let statusCode = 500;
+
+        if (error.message.startsWith('BANK_LOGIN_ERROR')) {
+            userMessage = 'As credenciais do banco expiraram. É necessário reconectar a conta bancária.';
+            statusCode = 401;
+        } else if (error.message.startsWith('BANK_OUTDATED')) {
+            userMessage = 'A conexão com o banco expirou. Reconecte sua conta para sincronizar novamente.';
+            statusCode = 410;
+        } else if (error.message.startsWith('BANK_ERROR')) {
+            userMessage = 'O banco retornou um erro ao atualizar. Tente novamente em alguns minutos.';
+            statusCode = 502;
+        } else if (error.message.startsWith('SYNC_TIMEOUT')) {
+            userMessage = 'O banco demorou muito para processar a atualização. Tente novamente em alguns minutos.';
+            statusCode = 504;
+        }
+
+        return res.status(statusCode).json({
+            success: false,
+            error: userMessage,
+            errorCode: error.message.split(':')[0] || 'SYNC_ERROR',
+            details: error.message
+        });
     }
 });
 
