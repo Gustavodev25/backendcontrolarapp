@@ -9,19 +9,15 @@ console.log('[Server] PORT from env:', process.env.PORT);
 console.log('[Server] Using PORT:', PORT);
 const { limiter, securityHeaders } = require('./middleware/security');
 
-// Security Middleware
-app.set('trust proxy', 1); // Trust Railway's reverse proxy for rate limiting
+app.set('trust proxy', 1);
 app.use(securityHeaders);
 app.use(limiter);
 
-// Strict CORS
 app.use(cors({
-    origin: '*', // TODO: Restrict this in production to specific app domains
+    origin: '*',
     methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'],
     allowedHeaders: ['Content-Type', 'Authorization', 'ngrok-skip-browser-warning']
 }));
-
-// Body parser with size limit (DoS protection)
 app.use(express.json({ limit: '10kb' }));
 
 app.use((req, res, next) => {
@@ -34,7 +30,6 @@ app.use((req, res, next) => {
     }));
     if (req.method === 'POST' || req.method === 'PUT') {
         const bodyCopy = { ...req.body };
-        // Ocultar dados sensíveis nos logs
         if (bodyCopy.password) bodyCopy.password = '***';
         if (bodyCopy.credentials) bodyCopy.credentials = '***';
         console.log(`[${timestamp}] Body:`, JSON.stringify(bodyCopy));
@@ -60,7 +55,7 @@ app.get('/api/diagnostics', (req, res) => {
             pluggyClientSecret: !!process.env.PLUGGY_CLIENT_SECRET,
             pluggySandbox: process.env.PLUGGY_SANDBOX || 'false',
             firebaseConfigured: !!(
-                process.env.FIREBASE_SERVICE_ACCOUNT || 
+                process.env.FIREBASE_SERVICE_ACCOUNT ||
                 (process.env.FIREBASE_PROJECT_ID && process.env.FIREBASE_PRIVATE_KEY)
             )
         },
@@ -76,7 +71,7 @@ app.get('/api/diagnostics', (req, res) => {
             'POST /api/asaas/webhook'
         ]
     };
-    
+
     res.json(diagnostics);
 });
 
@@ -89,7 +84,7 @@ app.use((err, req, res, next) => {
     console.error(`[${timestamp}] Stack:`, err.stack);
     console.error(`[${timestamp}] Path:`, req.path);
     console.error(`[${timestamp}] Method:`, req.method);
-    
+
     res.status(500).json({
         success: false,
         error: err.message || 'Internal server error',
@@ -98,6 +93,7 @@ app.use((err, req, res, next) => {
 });
 
 app.listen(PORT, '0.0.0.0', () => {
+    console.log(`[Servidor] Rodando na porta ${PORT} (Railway Ready) 🚂`);
     console.log(`
     ========================================
     🚀 ControlarApp Backend - ONLINE

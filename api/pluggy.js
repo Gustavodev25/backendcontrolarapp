@@ -73,9 +73,6 @@ router.use((req, res, next) => {
 
 router.use(injectAndEnforceUser);
 
-// ==========================================
-// CONFIGURAÇÕES PLUGGY
-// ==========================================
 const PLUGGY_API_URL = 'https://api.pluggy.ai';
 const CLIENT_ID = process.env.PLUGGY_CLIENT_ID;
 const CLIENT_SECRET = process.env.PLUGGY_CLIENT_SECRET;
@@ -207,10 +204,6 @@ const fetchTransactionsForAccount = async (token, accountId, fromDate) => {
     }
     return transactions;
 };
-
-// ==========================================
-// ROTAS DA API
-// ==========================================
 
 router.get('/connectors', async (req, res) => {
     try {
