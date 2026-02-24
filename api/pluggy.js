@@ -1,12 +1,7 @@
-// ============================================================================
-// api/pluggy.js - VERSÃO COMPLETA NÍVEL FINTECH 2026
-// Compatível 100% com o seu index.js (CORS global, limiter global, etc.)
-// /connectors é PÚBLICO (não precisa de login)
-// ============================================================================
-
 const express = require('express');
 const fetch = require('node-fetch');
 const { z } = require('zod');
+const admin = require('firebase-admin'); // Importando para verificar a autenticação
 
 const router = express.Router();
 
@@ -69,13 +64,13 @@ class PluggyClient {
             const timeout = setTimeout(() => controller.abort(), FETCH_TIMEOUT_MS);
 
             try {
-                const token = await this.getToken();
+                const token = url.includes('/auth') ? null : await this.getToken();
                 const response = await fetch(url, {
                     ...options,
                     signal: controller.signal,
                     headers: {
                         ...options.headers,
-                        'X-API-KEY': token,
+                        ...(token ? { 'X-API-KEY': token } : {}),
                     },
                 });
 
@@ -120,24 +115,32 @@ const syncSchema = z.object({
 
 const paramIdSchema = z.object({ id: z.string().uuid() });
 
-// ====================== MIDDLEWARE DE AUTENTICAÇÃO ======================
-const enforceUser = (req, res, next) => {
+// ====================== MIDDLEWARE DE AUTENTICAÇÃO CORRIGIDO ======================
+const enforceUser = async (req, res, next) => {
     // ROTAS PÚBLICAS (não precisam de login)
     if (['/webhook', '/ping', '/connectors'].some(p => req.path.includes(p))) {
         return next();
     }
 
-    if (!req.user?.uid) {
-        return res.status(401).json({ success: false, error: 'Não autenticado' });
+    // EXTRAIR TOKEN DO HEADER
+    const authHeader = req.headers.authorization;
+    if (!authHeader || !authHeader.startsWith('Bearer ')) {
+        console.warn(`[Auth] Falha: Token não fornecido na rota ${req.path}`);
+        return res.status(401).json({ success: false, error: 'Token de autenticação ausente' });
     }
 
-    const requestedUser = req.body?.userId || req.query?.userId;
-    if (requestedUser && requestedUser !== req.user.uid) {
-        console.warn(`[SECURITY] IDOR attempt - User: ${req.user.uid} IP: ${req.ip}`);
-        return res.status(403).json({ success: false, error: 'Acesso negado' });
+    const token = authHeader.split('Bearer ')[1];
+
+    try {
+        // VALIDAR TOKEN COM FIREBASE
+        const decodedToken = await admin.auth().verifyIdToken(token);
+        req.user = decodedToken;
+        req.currentUser = decodedToken.uid; // Define o UID globalmente para a rota
+        next();
+    } catch (error) {
+        console.error(`[Auth] Falha na validação do token:`, error.message);
+        return res.status(401).json({ success: false, error: 'Token inválido ou expirado' });
     }
-    req.currentUser = req.user.uid;
-    next();
 };
 
 router.use(enforceUser);
@@ -145,11 +148,14 @@ router.use(enforceUser);
 // ====================== ROTAS ======================
 router.get('/ping', (req, res) => res.json({ status: 'ok', timestamp: new Date().toISOString() }));
 
-// LISTAR BANCOS - PÚBLICO (essencial para o modal funcionar)
+// LISTAR BANCOS - PÚBLICO
 router.get('/connectors', async (req, res) => {
     try {
         const resp = await pluggy.safeFetch(`${PLUGGY_API_URL}/connectors?sandbox=${env.PLUGGY_SANDBOX}&types=PERSONAL_BANK,BUSINESS_BANK`);
-        if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
+        if (!resp.ok) {
+            const errData = await resp.text();
+            throw new Error(`HTTP ${resp.status} - ${errData}`);
+        }
         res.json(await resp.json());
     } catch (err) {
         console.error('[Connectors Error]', err.message);
@@ -157,14 +163,14 @@ router.get('/connectors', async (req, res) => {
     }
 });
 
-// Criar Item
+// Criar Item (Requer Login)
 router.post('/create-item', async (req, res) => {
     try {
         const body = createItemSchema.parse(req.body);
         const payload = {
             connectorId: body.connectorId,
             parameters: body.credentials || {},
-            clientUserId: req.currentUser,
+            clientUserId: req.currentUser, // Extraído do Firebase no Middleware!
             ...(body.products && { products: body.products }),
             ...(body.oauthRedirectUri && { clientUrl: body.oauthRedirectUri }),
             ...(body.webhookUrl && { webhookUrl: body.webhookUrl }),
@@ -173,6 +179,7 @@ router.post('/create-item', async (req, res) => {
         const resp = await pluggy.safeFetch(`${PLUGGY_API_URL}/items`, {
             method: 'POST',
             body: JSON.stringify(payload),
+            headers: { 'Content-Type': 'application/json' }
         });
 
         const data = await resp.json();
@@ -198,16 +205,12 @@ router.post('/force-refresh/:id', async (req, res) => {
         const { id } = paramIdSchema.parse({ id: req.params.id });
         await pluggy.safeFetch(`${PLUGGY_API_URL}/items/${id}`, {
             method: 'PATCH',
+            headers: { 'Content-Type': 'application/json' },
             body: JSON.stringify({}),
         });
-        res.status(202).json({
-            success: true,
-            message: 'Sincronização com o banco iniciada agora!',
-            itemId: id,
-        });
+        res.status(202).json({ success: true, message: 'Sincronização iniciada!', itemId: id });
     } catch (err) {
-        console.error('[Force Refresh Error]', err);
-        res.status(500).json({ success: false, error: 'Não foi possível forçar a atualização.' });
+        res.status(500).json({ success: false, error: 'Erro ao forçar atualização.' });
     }
 });
 
@@ -215,11 +218,11 @@ router.post('/force-refresh/:id', async (req, res) => {
 router.post('/sync', async (req, res) => {
     try {
         const { itemId, from, fullHistory = false, autoRefresh = false } = syncSchema.parse(req.body);
-        const token = await pluggy.getToken();
 
         if (autoRefresh) {
             pluggy.safeFetch(`${PLUGGY_API_URL}/items/${itemId}`, {
                 method: 'PATCH',
+                headers: { 'Content-Type': 'application/json' },
                 body: JSON.stringify({}),
             }).catch(e => console.warn('[AutoRefresh]', e.message));
         }
@@ -312,8 +315,9 @@ router.delete('/items/:id', async (req, res) => {
     }
 });
 
-// ====================== WEBHOOK ======================
-router.post('/webhook', express.raw({ type: 'application/json' }), async (req, res) => {
+// ====================== WEBHOOK CORRIGIDO ======================
+// Removido express.raw porque o index.js já faz o express.json()
+router.post('/webhook', async (req, res) => {
     const clientIp = req.ip || req.headers['x-forwarded-for'] || req.connection.remoteAddress;
 
     if (!PLUGGY_WEBHOOK_IPS.includes(clientIp) && !clientIp.includes('127.0.0.1')) {
@@ -321,10 +325,11 @@ router.post('/webhook', express.raw({ type: 'application/json' }), async (req, r
         return res.status(403).send('Forbidden');
     }
 
-    let body;
-    try {
-        body = JSON.parse(req.body.toString());
-    } catch {
+    // req.body JÁ É UM OBJETO devido ao express.json() no index.js
+    const body = req.body;
+
+    if (!body || !body.event) {
+        console.warn('[WEBHOOK] Corpo vazio ou sem evento');
         return res.status(400).send('Bad Request');
     }
 
