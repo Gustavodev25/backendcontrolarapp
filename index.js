@@ -1,37 +1,19 @@
 require('dotenv').config();
 const express = require('express');
 const cors = require('cors');
-const admin = require('firebase-admin'); // ADICIONADO: Necessário para validar tokens
-
-// Inicializa o Firebase Admin se ainda não estiver inicializado pelas envs do Railway
-if (!admin.apps.length) {
-    try {
-        admin.initializeApp({
-            credential: admin.credential.applicationDefault()
-        });
-        console.log('[Firebase] Admin inicializado com sucesso.');
-    } catch (e) {
-        console.warn('[Firebase] Aviso de inicialização:', e.message);
-    }
-}
-
 const pluggyRoutes = require('./api/pluggy');
+
 const app = express();
 const PORT = process.env.PORT || 3001;
-
 console.log('[Server] PORT from env:', process.env.PORT);
 console.log('[Server] Using PORT:', PORT);
 
-// Se os middlewares não existirem no seu projeto, remova as próximas duas linhas
-try {
-    const { limiter, securityHeaders } = require('./middleware/security');
-    app.use(securityHeaders);
-    app.use(limiter);
-} catch (e) {
-    console.warn('[Aviso] Middlewares de segurança não encontrados, ignorando.');
-}
+// O seu middleware original já inicializa o Firebase com sucesso lendo o FIREBASE_SERVICE_ACCOUNT
+const { limiter, securityHeaders } = require('./middleware/security');
 
 app.set('trust proxy', 1);
+app.use(securityHeaders);
+app.use(limiter);
 
 app.use(cors({
     origin: '*',
@@ -39,7 +21,7 @@ app.use(cors({
     allowedHeaders: ['Content-Type', 'Authorization', 'ngrok-skip-browser-warning']
 }));
 
-// Importante: Isso transforma o body em JSON para TODAS as rotas
+// Importante: garante a leitura correta do body em JSON (inclusive para os webhooks)
 app.use(express.json({ limit: '10kb' }));
 
 app.use((req, res, next) => {
@@ -67,10 +49,11 @@ app.get('/api/diagnostics', (req, res) => {
 
 app.use('/api/pluggy', pluggyRoutes);
 
-// Tenta carregar a rota do asaas, se existir
 try {
     app.use('/api/asaas', require('./api/asaas'));
-} catch (e) { }
+} catch (e) {
+    // Ignora silenciosamente caso a rota asaas não exista
+}
 
 app.use((err, req, res, next) => {
     const timestamp = new Date().toISOString();
