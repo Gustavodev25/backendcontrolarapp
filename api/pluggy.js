@@ -1,31 +1,31 @@
 // ============================================================================
-// PLUGGY ROUTER - NÍVEL FINTECH ENTERPRISE 2026 (COMPLETO)
-// Suporte completo: create, sync, force-refresh (sincroniza banco), webhook, etc.
+// api/pluggy.js - VERSÃO COMPLETA NÍVEL FINTECH 2026
+// Compatível 100% com o seu index.js (CORS global, limiter global, etc.)
+// /connectors é PÚBLICO (não precisa de login)
 // ============================================================================
 
 const express = require('express');
 const fetch = require('node-fetch');
-const rateLimit = require('express-rate-limit');
 const { z } = require('zod');
 
 const router = express.Router();
 
 // ====================== VALIDAÇÃO DE AMBIENTE ======================
 const envSchema = z.object({
-    PLUGGY_CLIENT_ID: z.string().min(1),
-    PLUGGY_CLIENT_SECRET: z.string().min(1),
+    PLUGGY_CLIENT_ID: z.string().min(1, 'PLUGGY_CLIENT_ID obrigatório'),
+    PLUGGY_CLIENT_SECRET: z.string().min(1, 'PLUGGY_CLIENT_SECRET obrigatório'),
     PLUGGY_SANDBOX: z.enum(['true', 'false']).optional().default('false'),
 });
 
 const env = envSchema.parse(process.env);
 
 const PLUGGY_API_URL = 'https://api.pluggy.ai';
-const PLUGGY_WEBHOOK_IPS = ['177.71.238.212']; // IP oficial Pluggy produção
+const PLUGGY_WEBHOOK_IPS = ['177.71.238.212'];
 const TRANSACTIONS_PAGE_SIZE = 500;
 const MAX_TRANSACTION_PAGES = 10;
-const FETCH_TIMEOUT_MS = 25_000;
+const FETCH_TIMEOUT_MS = 25000;
 
-// ====================== CLIENT PLUGGY (SINGLETON + CACHE INTELIGENTE) ======================
+// ====================== CLIENT PLUGGY ======================
 class PluggyClient {
     static instance;
     token = null;
@@ -102,7 +102,7 @@ class PluggyClient {
 
 const pluggy = PluggyClient.getInstance();
 
-// ====================== SCHEMAS ZOD ======================
+// ====================== SCHEMAS ======================
 const createItemSchema = z.object({
     connectorId: z.union([z.string(), z.number()]),
     credentials: z.record(z.string(), z.any()).optional(),
@@ -120,19 +120,16 @@ const syncSchema = z.object({
 
 const paramIdSchema = z.object({ id: z.string().uuid() });
 
-// ====================== MIDDLEWARES ======================
-const limiter = rateLimit({
-    windowMs: 60 * 1000,
-    max: 60,
-    standardHeaders: true,
-    legacyHeaders: false,
-});
-
-router.use(limiter);
-
+// ====================== MIDDLEWARE DE AUTENTICAÇÃO ======================
 const enforceUser = (req, res, next) => {
-    if (['/webhook', '/ping'].some(p => req.path.includes(p))) return next();
-    if (!req.user?.uid) return res.status(401).json({ success: false, error: 'Não autenticado' });
+    // ROTAS PÚBLICAS (não precisam de login)
+    if (['/webhook', '/ping', '/connectors'].some(p => req.path.includes(p))) {
+        return next();
+    }
+
+    if (!req.user?.uid) {
+        return res.status(401).json({ success: false, error: 'Não autenticado' });
+    }
 
     const requestedUser = req.body?.userId || req.query?.userId;
     if (requestedUser && requestedUser !== req.user.uid) {
@@ -148,12 +145,14 @@ router.use(enforceUser);
 // ====================== ROTAS ======================
 router.get('/ping', (req, res) => res.json({ status: 'ok', timestamp: new Date().toISOString() }));
 
-// Listar connectors
+// LISTAR BANCOS - PÚBLICO (essencial para o modal funcionar)
 router.get('/connectors', async (req, res) => {
     try {
         const resp = await pluggy.safeFetch(`${PLUGGY_API_URL}/connectors?sandbox=${env.PLUGGY_SANDBOX}&types=PERSONAL_BANK,BUSINESS_BANK`);
+        if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
         res.json(await resp.json());
     } catch (err) {
+        console.error('[Connectors Error]', err.message);
         res.status(502).json({ success: false, error: 'Serviço temporariamente indisponível' });
     }
 });
@@ -193,46 +192,41 @@ router.post('/create-item', async (req, res) => {
     }
 });
 
-// FORCE REFRESH - Sincroniza o banco (o que você mais pediu)
+// Force Refresh
 router.post('/force-refresh/:id', async (req, res) => {
     try {
         const { id } = paramIdSchema.parse({ id: req.params.id });
-
         await pluggy.safeFetch(`${PLUGGY_API_URL}/items/${id}`, {
             method: 'PATCH',
             body: JSON.stringify({}),
         });
-
         res.status(202).json({
             success: true,
-            message: 'Sincronização com o banco iniciada agora! Novos dados chegarão via webhook em até 2 minutos.',
+            message: 'Sincronização com o banco iniciada agora!',
             itemId: id,
         });
     } catch (err) {
         console.error('[Force Refresh Error]', err);
-        res.status(500).json({ success: false, error: 'Não foi possível forçar a atualização com o banco.' });
+        res.status(500).json({ success: false, error: 'Não foi possível forçar a atualização.' });
     }
 });
 
-// SYNC - Busca dados + opção de autoRefresh
+// Sync
 router.post('/sync', async (req, res) => {
     try {
         const { itemId, from, fullHistory = false, autoRefresh = false } = syncSchema.parse(req.body);
         const token = await pluggy.getToken();
 
-        // Auto-refresh em background (se solicitado)
         if (autoRefresh) {
             pluggy.safeFetch(`${PLUGGY_API_URL}/items/${itemId}`, {
                 method: 'PATCH',
                 body: JSON.stringify({}),
-            }).catch(e => console.warn('[AutoRefresh Background]', e.message));
+            }).catch(e => console.warn('[AutoRefresh]', e.message));
         }
 
-        // Status atual do item
         const itemRes = await pluggy.safeFetch(`${PLUGGY_API_URL}/items/${itemId}`);
         const itemData = itemRes.ok ? await itemRes.json() : { status: 'UNKNOWN', updatedAt: null };
 
-        // Busca contas
         const accountsRes = await pluggy.safeFetch(`${PLUGGY_API_URL}/accounts?itemId=${itemId}`);
         const { results: accountsList = [] } = await accountsRes.json();
 
@@ -286,7 +280,7 @@ router.post('/sync', async (req, res) => {
     }
 });
 
-// Listar items do usuário
+// Listar items
 router.get('/items', async (req, res) => {
     try {
         const resp = await pluggy.safeFetch(`${PLUGGY_API_URL}/items?clientUserId=${req.currentUser}`);
@@ -318,7 +312,7 @@ router.delete('/items/:id', async (req, res) => {
     }
 });
 
-// ====================== WEBHOOK (Segurança nível banco) ======================
+// ====================== WEBHOOK ======================
 router.post('/webhook', express.raw({ type: 'application/json' }), async (req, res) => {
     const clientIp = req.ip || req.headers['x-forwarded-for'] || req.connection.remoteAddress;
 
@@ -335,8 +329,6 @@ router.post('/webhook', express.raw({ type: 'application/json' }), async (req, r
     }
 
     console.info(`[WEBHOOK] Evento: ${body.event} | Item: ${body.itemId} | User: ${body.clientUserId}`);
-
-    // Aqui você pode disparar WebSocket, FCM ou fila (BullMQ)
     res.status(200).json({ received: true });
 });
 
