@@ -420,6 +420,7 @@ router.post('/create-item', async (req, res) => {
         const oauthUrl =
             data.oauthUrl ||
             data.parameter?.oauthUrl ||
+            data.parameter?.data ||
             data.userAction?.url ||
             data.userAction?.attributes?.url ||
             null;
