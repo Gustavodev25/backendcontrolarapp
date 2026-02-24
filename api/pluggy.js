@@ -217,6 +217,42 @@ const mapItemOwnershipError = (err) => {
     return { status: 500, message: 'Erro ao validar item' };
 };
 
+const extractItemErrorSnapshot = (item) => {
+    const error = item?.error && typeof item.error === 'object' ? item.error : {};
+    return {
+        status: item?.status || null,
+        executionStatus: item?.executionStatus || null,
+        errorCode: error?.code || null,
+        errorMessage: error?.message || null,
+        providerMessage: error?.providerMessage || null,
+        connector: item?.connector?.name || null,
+        updatedAt: item?.updatedAt || null,
+    };
+};
+
+const logItemDiagnostics = async (source, event, itemId) => {
+    if (!itemId) return;
+    try {
+        const itemRes = await pluggy.safeFetch(`${PLUGGY_API_URL}/items/${itemId}`);
+        if (!itemRes.ok) {
+            console.warn(`[${source}] Event: ${event} | Item: ${itemId} | Snapshot unavailable (HTTP ${itemRes.status})`);
+            return;
+        }
+
+        const item = await itemRes.json();
+        const snapshot = extractItemErrorSnapshot(item);
+
+        console.warn(
+            `[${source}] Event: ${event} | Item: ${itemId} | Status: ${snapshot.status || 'N/A'} | Exec: ${snapshot.executionStatus || 'N/A'} | ErrorCode: ${snapshot.errorCode || 'N/A'} | ErrorMessage: ${snapshot.errorMessage || 'N/A'}`
+        );
+        if (snapshot.providerMessage) {
+            console.warn(`[${source}] Provider detail | Item: ${itemId} | ${snapshot.providerMessage}`);
+        }
+    } catch (error) {
+        console.warn(`[${source}] Event: ${event} | Item: ${itemId} | Failed to fetch diagnostics: ${error?.message || error}`);
+    }
+};
+
 const ensureItemOwnership = async (itemId, expectedUserId) => {
     const itemRes = await pluggy.safeFetch(`${PLUGGY_API_URL}/items/${itemId}`);
     if (!itemRes.ok) {
@@ -305,9 +341,17 @@ router.post('/oauth-callback', async (req, res) => {
     const body = req.body || {};
     const event = body.event || 'OAUTH_CALLBACK';
     const itemId = body.itemId || getQueryValue(req.query.itemId) || null;
+    const bodyErrorCode = body?.error?.code || null;
+    const bodyErrorMessage = body?.error?.message || null;
 
-    console.info(`[Pluggy OAuth Callback] Event: ${event} | Item: ${itemId}`);
+    console.info(
+        `[Pluggy OAuth Callback] Event: ${event} | Item: ${itemId} | ErrorCode: ${bodyErrorCode || 'N/A'} | ErrorMessage: ${bodyErrorMessage || 'N/A'}`
+    );
     res.status(200).json({ received: true });
+
+    if (event === 'item/error' && itemId) {
+        logItemDiagnostics('Pluggy OAuth Callback', event, itemId).catch(() => null);
+    }
 });
 
 router.post('/webhook', async (req, res) => {
@@ -322,8 +366,16 @@ router.post('/webhook', async (req, res) => {
         return res.status(400).send('Bad Request');
     }
 
-    console.info(`[WEBHOOK] Evento: ${body.event} | Item: ${body.itemId} | User: ${body.clientUserId}`);
+    const bodyErrorCode = body?.error?.code || null;
+    const bodyErrorMessage = body?.error?.message || null;
+    console.info(
+        `[WEBHOOK] Evento: ${body.event} | Item: ${body.itemId} | User: ${body.clientUserId} | ErrorCode: ${bodyErrorCode || 'N/A'} | ErrorMessage: ${bodyErrorMessage || 'N/A'}`
+    );
     res.status(200).json({ received: true });
+
+    if (body.event === 'item/error' && body.itemId) {
+        logItemDiagnostics('Pluggy Webhook', body.event, body.itemId).catch(() => null);
+    }
 });
 
 // ====================== ROTAS AUTENTICADAS ======================
@@ -353,6 +405,9 @@ router.post('/create-item', async (req, res) => {
             const alreadyUpdating =
                 data.codeDescription?.includes('ALREADY_UPDATING') ||
                 data.message?.includes('ALREADY_UPDATING');
+            console.warn(
+                `[Pluggy Create Item] HTTP ${resp.status} | Connector: ${body.connectorId} | User: ${req.currentUser} | Code: ${data?.code || data?.codeDescription || 'N/A'} | Message: ${data?.message || 'N/A'}`
+            );
 
             return res.status(resp.status).json({
                 success: false,
