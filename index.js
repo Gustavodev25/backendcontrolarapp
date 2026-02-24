@@ -2,6 +2,7 @@ require('dotenv').config();
 const express = require('express');
 const cors = require('cors');
 const pluggyRoutes = require('./api/pluggy');
+const { isFirebaseConfigured, getFirebaseInitStatus } = require('./lib/firebaseAdmin');
 
 const app = express();
 const PORT = process.env.PORT || 3001;
@@ -35,6 +36,9 @@ app.get('/health', (req, res) => {
 });
 
 app.get('/api/diagnostics', (req, res) => {
+    const firebaseStatus = getFirebaseInitStatus();
+    const pluggyAuthConfigured = !!process.env.PLUGGY_CLIENT_ID && !!process.env.PLUGGY_CLIENT_SECRET;
+
     res.json({
         status: 'running',
         timestamp: new Date().toISOString(),
@@ -43,6 +47,10 @@ app.get('/api/diagnostics', (req, res) => {
             pluggyClientId: !!process.env.PLUGGY_CLIENT_ID,
             pluggyClientSecret: !!process.env.PLUGGY_CLIENT_SECRET,
             pluggySandbox: process.env.PLUGGY_SANDBOX || 'false',
+            pluggyAuthConfigured,
+            firebaseConfigured: isFirebaseConfigured(),
+            firebaseInitError: firebaseStatus.error,
+            oauthCallbackEnabled: true,
         }
     });
 });

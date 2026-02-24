@@ -1,7 +1,7 @@
 const express = require('express');
 const fetch = require('node-fetch');
 const { z } = require('zod');
-const admin = require('firebase-admin'); // Importando para verificar a autenticação
+const { getFirebaseAdmin, isFirebaseConfigured } = require('../lib/firebaseAdmin');
 
 const router = express.Router();
 
@@ -15,10 +15,104 @@ const envSchema = z.object({
 const env = envSchema.parse(process.env);
 
 const PLUGGY_API_URL = 'https://api.pluggy.ai';
+const DEFAULT_BACKEND_URL = 'https://backendcontrolarapp-production.up.railway.app';
+const DEFAULT_APP_REDIRECT_URI = 'controlarapp://open-finance/callback';
 const PLUGGY_WEBHOOK_IPS = ['177.71.238.212'];
+const PUBLIC_ROUTES = ['/webhook', '/ping', '/connectors', '/oauth-callback'];
 const TRANSACTIONS_PAGE_SIZE = 500;
 const MAX_TRANSACTION_PAGES = 10;
 const FETCH_TIMEOUT_MS = 25000;
+
+const normalizeUrlBase = (value) => String(value || '').trim().replace(/\/+$/, '');
+
+const getQueryValue = (value) => {
+    if (Array.isArray(value)) return value[0];
+    if (typeof value === 'string') return value;
+    return undefined;
+};
+
+const getRequestBaseUrl = (req) => {
+    const configured = normalizeUrlBase(process.env.PUBLIC_BASE_URL || process.env.RAILWAY_STATIC_URL);
+    if (configured) {
+        return configured.startsWith('http://') || configured.startsWith('https://')
+            ? configured
+            : `https://${configured}`;
+    }
+
+    const forwardedProto = getQueryValue(req.headers['x-forwarded-proto']) || 'https';
+    const forwardedHost = getQueryValue(req.headers['x-forwarded-host']) || req.headers.host;
+    if (forwardedHost) return `${forwardedProto}://${forwardedHost}`;
+
+    return DEFAULT_BACKEND_URL;
+};
+
+const toValidAppRedirectUri = (candidate) => {
+    if (!candidate) return DEFAULT_APP_REDIRECT_URI;
+    try {
+        const parsed = new URL(candidate);
+        return parsed.toString();
+    } catch {
+        return DEFAULT_APP_REDIRECT_URI;
+    }
+};
+
+const buildBackendOAuthCallbackUrl = (req, appRedirectUri) => {
+    const callbackUrl = new URL('/api/pluggy/oauth-callback', getRequestBaseUrl(req));
+    callbackUrl.searchParams.set('appRedirectUri', toValidAppRedirectUri(appRedirectUri));
+    return callbackUrl.toString();
+};
+
+const escapeHtml = (unsafe = '') => String(unsafe).replace(/[&<>"']/g, (match) => ({
+    '&': '&amp;',
+    '<': '&lt;',
+    '>': '&gt;',
+    '"': '&quot;',
+    "'": '&#039;',
+}[match]));
+
+const renderOAuthRedirectPage = (redirectUrl) => `<!DOCTYPE html>
+<html lang="pt-BR">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Retornando ao aplicativo</title>
+  <meta http-equiv="refresh" content="0;url=${escapeHtml(redirectUrl)}" />
+  <style>
+    body { font-family: system-ui, -apple-system, sans-serif; background: #0f0f10; color: #f3f4f6; display: flex; align-items: center; justify-content: center; min-height: 100vh; margin: 0; }
+    .card { width: min(92vw, 460px); background: #19191b; border: 1px solid #2a2a2f; border-radius: 16px; padding: 24px; text-align: center; }
+    .spinner { width: 34px; height: 34px; border-radius: 999px; border: 3px solid #3a3a40; border-top-color: #d97757; margin: 0 auto 16px; animation: spin 0.9s linear infinite; }
+    a { color: #f29f7d; word-break: break-all; }
+    @keyframes spin { to { transform: rotate(360deg); } }
+  </style>
+</head>
+<body>
+  <div class="card">
+    <div class="spinner"></div>
+    <h2>Autorização recebida</h2>
+    <p>Estamos retornando você para o app.</p>
+    <p>Se não abrir automaticamente, toque no link:</p>
+    <p><a href="${escapeHtml(redirectUrl)}">${escapeHtml(redirectUrl)}</a></p>
+  </div>
+  <script>
+    setTimeout(function() { window.location.href = ${JSON.stringify(redirectUrl)}; }, 400);
+  </script>
+</body>
+</html>`;
+
+const normalizeIp = (value) => String(value || '').trim().replace(/^::ffff:/, '');
+
+const getClientIp = (req) => {
+    const xForwardedFor = req.headers['x-forwarded-for'];
+    if (typeof xForwardedFor === 'string' && xForwardedFor.trim()) {
+        return normalizeIp(xForwardedFor.split(',')[0].trim());
+    }
+    if (Array.isArray(xForwardedFor) && xForwardedFor.length > 0) {
+        return normalizeIp(String(xForwardedFor[0]).split(',')[0].trim());
+    }
+    return normalizeIp(req.ip || req.connection?.remoteAddress || '');
+};
+
+const isLocalIp = (ip) => ['127.0.0.1', '::1', 'localhost'].includes(ip);
 
 // ====================== CLIENT PLUGGY ======================
 class PluggyClient {
@@ -91,7 +185,7 @@ class PluggyClient {
     }
 
     delay(ms) {
-        return new Promise(r => setTimeout(r, ms));
+        return new Promise((resolve) => setTimeout(resolve, ms));
     }
 }
 
@@ -102,6 +196,7 @@ const createItemSchema = z.object({
     connectorId: z.union([z.string(), z.number()]),
     credentials: z.record(z.string(), z.any()).optional(),
     oauthRedirectUri: z.string().url().optional(),
+    appRedirectUri: z.string().url().optional(),
     products: z.array(z.string().toUpperCase()).optional(),
     webhookUrl: z.string().url().optional(),
 });
@@ -115,40 +210,65 @@ const syncSchema = z.object({
 
 const paramIdSchema = z.object({ id: z.string().uuid() });
 
-// ====================== MIDDLEWARE DE AUTENTICAÇÃO CORRIGIDO ======================
+const mapItemOwnershipError = (err) => {
+    if (err && typeof err === 'object' && 'status' in err && 'message' in err) {
+        return err;
+    }
+    return { status: 500, message: 'Erro ao validar item' };
+};
+
+const ensureItemOwnership = async (itemId, expectedUserId) => {
+    const itemRes = await pluggy.safeFetch(`${PLUGGY_API_URL}/items/${itemId}`);
+    if (!itemRes.ok) {
+        const status = itemRes.status === 404 ? 404 : 502;
+        throw { status, message: 'Item não encontrado' };
+    }
+
+    const item = await itemRes.json();
+    if (!item?.clientUserId || item.clientUserId !== expectedUserId) {
+        throw { status: 403, message: 'Acesso negado para este item' };
+    }
+
+    return item;
+};
+
+// ====================== MIDDLEWARE DE AUTENTICAÇÃO ======================
 const enforceUser = async (req, res, next) => {
-    // ROTAS PÚBLICAS (não precisam de login)
-    if (['/webhook', '/ping', '/connectors'].some(p => req.path.includes(p))) {
+    if (PUBLIC_ROUTES.some((route) => req.path.startsWith(route))) {
         return next();
     }
 
-    // EXTRAIR TOKEN DO HEADER
+    if (!isFirebaseConfigured()) {
+        return res.status(500).json({
+            success: false,
+            error: 'Firebase Admin não configurado no servidor'
+        });
+    }
+
     const authHeader = req.headers.authorization;
     if (!authHeader || !authHeader.startsWith('Bearer ')) {
-        console.warn(`[Auth] Falha: Token não fornecido na rota ${req.path}`);
         return res.status(401).json({ success: false, error: 'Token de autenticação ausente' });
     }
 
-    const token = authHeader.split('Bearer ')[1];
-
     try {
-        // VALIDAR TOKEN COM FIREBASE
-        const decodedToken = await admin.auth().verifyIdToken(token);
+        const token = authHeader.split('Bearer ')[1];
+        const firebaseAdmin = getFirebaseAdmin();
+        const decodedToken = await firebaseAdmin.auth().verifyIdToken(token);
         req.user = decodedToken;
-        req.currentUser = decodedToken.uid; // Define o UID globalmente para a rota
-        next();
+        req.currentUser = decodedToken.uid;
+        return next();
     } catch (error) {
-        console.error(`[Auth] Falha na validação do token:`, error.message);
         return res.status(401).json({ success: false, error: 'Token inválido ou expirado' });
     }
 };
 
 router.use(enforceUser);
 
-// ====================== ROTAS ======================
-router.get('/ping', (req, res) => res.json({ status: 'ok', timestamp: new Date().toISOString() }));
+// ====================== ROTAS PÚBLICAS ======================
+router.get('/ping', (req, res) => {
+    res.json({ status: 'ok', timestamp: new Date().toISOString() });
+});
 
-// LISTAR BANCOS - PÚBLICO
 router.get('/connectors', async (req, res) => {
     try {
         const resp = await pluggy.safeFetch(`${PLUGGY_API_URL}/connectors?sandbox=${env.PLUGGY_SANDBOX}&types=PERSONAL_BANK,BUSINESS_BANK`);
@@ -158,21 +278,67 @@ router.get('/connectors', async (req, res) => {
         }
         res.json(await resp.json());
     } catch (err) {
-        console.error('[Connectors Error]', err.message);
         res.status(502).json({ success: false, error: 'Serviço temporariamente indisponível' });
     }
 });
 
-// Criar Item (Requer Login)
+router.get('/oauth-callback', async (req, res) => {
+    try {
+        const itemId = getQueryValue(req.query.itemId);
+        const status = getQueryValue(req.query.status);
+        const error = getQueryValue(req.query.error);
+        const appRedirectUri = toValidAppRedirectUri(getQueryValue(req.query.appRedirectUri));
+
+        const redirectUrl = new URL(appRedirectUri);
+        if (itemId) redirectUrl.searchParams.set('itemId', itemId);
+        if (status) redirectUrl.searchParams.set('status', status);
+        if (error) redirectUrl.searchParams.set('error', error);
+
+        const finalUrl = redirectUrl.toString();
+        res.status(200).send(renderOAuthRedirectPage(finalUrl));
+    } catch (err) {
+        res.status(500).json({ success: false, error: 'Falha ao processar callback OAuth' });
+    }
+});
+
+router.post('/oauth-callback', async (req, res) => {
+    const body = req.body || {};
+    const event = body.event || 'OAUTH_CALLBACK';
+    const itemId = body.itemId || getQueryValue(req.query.itemId) || null;
+
+    console.info(`[Pluggy OAuth Callback] Event: ${event} | Item: ${itemId}`);
+    res.status(200).json({ received: true });
+});
+
+router.post('/webhook', async (req, res) => {
+    const clientIp = getClientIp(req);
+
+    if (!PLUGGY_WEBHOOK_IPS.includes(clientIp) && !isLocalIp(clientIp)) {
+        return res.status(403).send('Forbidden');
+    }
+
+    const body = req.body;
+    if (!body || !body.event) {
+        return res.status(400).send('Bad Request');
+    }
+
+    console.info(`[WEBHOOK] Evento: ${body.event} | Item: ${body.itemId} | User: ${body.clientUserId}`);
+    res.status(200).json({ received: true });
+});
+
+// ====================== ROTAS AUTENTICADAS ======================
 router.post('/create-item', async (req, res) => {
     try {
         const body = createItemSchema.parse(req.body);
+        const appRedirectUri = body.appRedirectUri || body.oauthRedirectUri || DEFAULT_APP_REDIRECT_URI;
+        const callbackUrl = buildBackendOAuthCallbackUrl(req, appRedirectUri);
+
         const payload = {
             connectorId: body.connectorId,
             parameters: body.credentials || {},
-            clientUserId: req.currentUser, // Extraído do Firebase no Middleware!
+            clientUserId: req.currentUser,
+            clientUrl: callbackUrl,
             ...(body.products && { products: body.products }),
-            ...(body.oauthRedirectUri && { clientUrl: body.oauthRedirectUri }),
             ...(body.webhookUrl && { webhookUrl: body.webhookUrl }),
         };
 
@@ -183,57 +349,87 @@ router.post('/create-item', async (req, res) => {
         });
 
         const data = await resp.json();
-
         if (!resp.ok) {
-            const alreadyUpdating = data.codeDescription?.includes('ALREADY_UPDATING') || data.message?.includes('ALREADY_UPDATING');
+            const alreadyUpdating =
+                data.codeDescription?.includes('ALREADY_UPDATING') ||
+                data.message?.includes('ALREADY_UPDATING');
+
             return res.status(resp.status).json({
                 success: false,
-                error: alreadyUpdating ? 'Conexão já em andamento. Aguarde o webhook.' : (data.message || 'Falha ao conectar'),
+                error: alreadyUpdating
+                    ? 'Conexão já em andamento. Aguarde o webhook.'
+                    : (data.message || 'Falha ao conectar'),
             });
         }
 
-        const oauthUrl = data.clientUrl || data.oauthUrl || data.parameter?.oauthUrl;
-        res.json({ success: true, item: data, oauthUrl });
+        const oauthUrl =
+            data.oauthUrl ||
+            data.parameter?.oauthUrl ||
+            data.userAction?.url ||
+            data.userAction?.attributes?.url ||
+            null;
+
+        return res.json({
+            success: true,
+            item: data,
+            oauthUrl,
+            callbackUrl
+        });
     } catch (err) {
-        res.status(400).json({ success: false, error: err.message });
+        return res.status(400).json({ success: false, error: err.message });
     }
 });
 
-// Force Refresh
 router.post('/force-refresh/:id', async (req, res) => {
     try {
         const { id } = paramIdSchema.parse({ id: req.params.id });
-        await pluggy.safeFetch(`${PLUGGY_API_URL}/items/${id}`, {
+        await ensureItemOwnership(id, req.currentUser);
+
+        const refreshRes = await pluggy.safeFetch(`${PLUGGY_API_URL}/items/${id}`, {
             method: 'PATCH',
             headers: { 'Content-Type': 'application/json' },
             body: JSON.stringify({}),
         });
-        res.status(202).json({ success: true, message: 'Sincronização iniciada!', itemId: id });
+
+        if (!refreshRes.ok) {
+            return res.status(502).json({ success: false, error: 'Falha ao iniciar atualização do item' });
+        }
+
+        return res.status(202).json({
+            success: true,
+            message: 'Sincronização iniciada!',
+            itemId: id
+        });
     } catch (err) {
-        res.status(500).json({ success: false, error: 'Erro ao forçar atualização.' });
+        const mapped = mapItemOwnershipError(err);
+        return res.status(mapped.status).json({ success: false, error: mapped.message });
     }
 });
 
-// Sync
 router.post('/sync', async (req, res) => {
     try {
         const { itemId, from, fullHistory = false, autoRefresh = false } = syncSchema.parse(req.body);
+        const itemData = await ensureItemOwnership(itemId, req.currentUser);
 
         if (autoRefresh) {
             pluggy.safeFetch(`${PLUGGY_API_URL}/items/${itemId}`, {
                 method: 'PATCH',
                 headers: { 'Content-Type': 'application/json' },
                 body: JSON.stringify({}),
-            }).catch(e => console.warn('[AutoRefresh]', e.message));
+            }).catch(() => null);
         }
 
-        const itemRes = await pluggy.safeFetch(`${PLUGGY_API_URL}/items/${itemId}`);
-        const itemData = itemRes.ok ? await itemRes.json() : { status: 'UNKNOWN', updatedAt: null };
-
         const accountsRes = await pluggy.safeFetch(`${PLUGGY_API_URL}/accounts?itemId=${itemId}`);
-        const { results: accountsList = [] } = await accountsRes.json();
+        if (!accountsRes.ok) {
+            return res.status(502).json({ success: false, error: 'Erro ao buscar contas do item' });
+        }
 
-        const fromDate = from || (fullHistory ? '2020-01-01' : new Date(Date.now() - 90 * 24 * 60 * 60 * 1000).toISOString().split('T')[0]);
+        const { results: accountsList = [] } = await accountsRes.json();
+        const fromDate = from || (
+            fullHistory
+                ? '2020-01-01'
+                : new Date(Date.now() - 90 * 24 * 60 * 60 * 1000).toISOString().split('T')[0]
+        );
 
         const enrichedAccounts = await Promise.all(accountsList.map(async (account) => {
             let allTx = [];
@@ -249,92 +445,82 @@ router.post('/sync', async (req, res) => {
                 });
 
                 const txRes = await pluggy.safeFetch(`${PLUGGY_API_URL}/transactions?${params}`);
-                const txData = txRes.ok ? await txRes.json() : { results: [] };
-                allTx = [...allTx, ...txData.results];
+                const txData = txRes.ok ? await txRes.json() : { results: [], totalPages: page };
+                allTx = [...allTx, ...(txData.results || [])];
 
-                if (txData.totalPages <= page) hasMore = false;
-                page++;
+                if (Number(txData.totalPages || 0) <= page) hasMore = false;
+                page += 1;
             }
 
             let bills = [];
             if (account.type === 'CREDIT') {
                 const billsRes = await pluggy.safeFetch(`${PLUGGY_API_URL}/accounts/${account.id}/bills`);
                 if (billsRes.ok) {
-                    const b = await billsRes.json();
-                    bills = b.results || [];
+                    const billsPayload = await billsRes.json();
+                    bills = billsPayload.results || [];
                 }
             }
 
             return { ...account, transactions: allTx, bills };
         }));
 
-        res.json({
+        return res.json({
             success: true,
             itemStatus: itemData.status,
             lastUpdatedAt: itemData.updatedAt,
             isRefreshing: itemData.status === 'UPDATING' || autoRefresh,
+            connector: itemData.connector || null,
             accounts: enrichedAccounts,
-            totalTransactions: enrichedAccounts.reduce((sum, a) => sum + a.transactions.length, 0),
+            totalTransactions: enrichedAccounts.reduce((sum, account) => sum + (account.transactions?.length || 0), 0),
             syncedAt: new Date().toISOString(),
         });
     } catch (err) {
-        console.error('[Sync Error]', err);
-        res.status(500).json({ success: false, error: 'Erro ao buscar dados sincronizados.' });
+        const mapped = mapItemOwnershipError(err);
+        return res.status(mapped.status).json({
+            success: false,
+            error: mapped.message || 'Erro ao buscar dados sincronizados.'
+        });
     }
 });
 
-// Listar items
 router.get('/items', async (req, res) => {
     try {
         const resp = await pluggy.safeFetch(`${PLUGGY_API_URL}/items?clientUserId=${req.currentUser}`);
-        res.json(await resp.json());
+        if (!resp.ok) {
+            return res.status(502).json({ success: false, error: 'Erro ao listar items' });
+        }
+        return res.json(await resp.json());
     } catch (err) {
-        res.status(502).json({ success: false, error: 'Erro ao listar items' });
+        return res.status(502).json({ success: false, error: 'Erro ao listar items' });
     }
 });
 
-// Detalhes de um item
 router.get('/items/:id', async (req, res) => {
     try {
         const { id } = paramIdSchema.parse({ id: req.params.id });
-        const resp = await pluggy.safeFetch(`${PLUGGY_API_URL}/items/${id}`);
-        res.json(await resp.json());
+        const item = await ensureItemOwnership(id, req.currentUser);
+        return res.json({ success: true, item });
     } catch (err) {
-        res.status(404).json({ success: false, error: 'Item não encontrado' });
+        const mapped = mapItemOwnershipError(err);
+        return res.status(mapped.status).json({ success: false, error: mapped.message });
     }
 });
 
-// Disconnect
 router.delete('/items/:id', async (req, res) => {
     try {
         const { id } = paramIdSchema.parse({ id: req.params.id });
-        await pluggy.safeFetch(`${PLUGGY_API_URL}/items/${id}`, { method: 'DELETE' });
-        res.json({ success: true, message: 'Item desconectado com sucesso' });
+        await ensureItemOwnership(id, req.currentUser);
+
+        const deleteRes = await pluggy.safeFetch(`${PLUGGY_API_URL}/items/${id}`, { method: 'DELETE' });
+        if (!deleteRes.ok) {
+            return res.status(502).json({ success: false, error: 'Falha ao desconectar item' });
+        }
+
+        return res.json({ success: true, message: 'Item desconectado com sucesso' });
     } catch (err) {
-        res.status(500).json({ success: false, error: 'Falha ao desconectar' });
+        const mapped = mapItemOwnershipError(err);
+        return res.status(mapped.status).json({ success: false, error: mapped.message });
     }
-});
-
-// ====================== WEBHOOK CORRIGIDO ======================
-// Removido express.raw porque o index.js já faz o express.json()
-router.post('/webhook', async (req, res) => {
-    const clientIp = req.ip || req.headers['x-forwarded-for'] || req.connection.remoteAddress;
-
-    if (!PLUGGY_WEBHOOK_IPS.includes(clientIp) && !clientIp.includes('127.0.0.1')) {
-        console.warn(`[SECURITY] Webhook IP inválido: ${clientIp}`);
-        return res.status(403).send('Forbidden');
-    }
-
-    // req.body JÁ É UM OBJETO devido ao express.json() no index.js
-    const body = req.body;
-
-    if (!body || !body.event) {
-        console.warn('[WEBHOOK] Corpo vazio ou sem evento');
-        return res.status(400).send('Bad Request');
-    }
-
-    console.info(`[WEBHOOK] Evento: ${body.event} | Item: ${body.itemId} | User: ${body.clientUserId}`);
-    res.status(200).json({ received: true });
 });
 
 module.exports = router;
