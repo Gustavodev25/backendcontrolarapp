@@ -493,7 +493,7 @@ router.post('/sync', async (req, res) => {
             : MAX_TRANSACTION_PAGES_DEFAULT;
 
         const enrichedAccounts = [];
-        const CONCURRENT_ACCOUNTS = 3; // Limita a 3 contas simultâneas para evitar gargalo e limit rate da Pluggy
+        const CONCURRENT_ACCOUNTS = 3;
 
         for (let i = 0; i < accountsList.length; i += CONCURRENT_ACCOUNTS) {
             const batch = accountsList.slice(i, i + CONCURRENT_ACCOUNTS);
