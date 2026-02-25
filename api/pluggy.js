@@ -532,7 +532,7 @@ router.post('/sync', async (req, res) => {
 
                     const txRes = await pluggy.safeFetch(`${PLUGGY_API_URL}/transactions?${params}`);
                     const txData = txRes.ok ? await txRes.json() : { results: [], totalPages: page };
-                    allTx = [...allTx, ...(txData.results || [])];
+                    allTx.push(...(txData.results || []));
 
                     if (Number(txData.totalPages || 0) <= page) hasMore = false;
                     page += 1;
