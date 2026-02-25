@@ -20,8 +20,8 @@ const DEFAULT_APP_REDIRECT_URI = 'controlarapp://open-finance/callback';
 const PLUGGY_WEBHOOK_IPS = ['177.71.238.212'];
 const PUBLIC_ROUTES = ['/webhook', '/ping', '/connectors', '/oauth-callback'];
 const TRANSACTIONS_PAGE_SIZE = 500;
-const MAX_TRANSACTION_PAGES_DEFAULT = 10;
-const MAX_TRANSACTION_PAGES_FULL_HISTORY = 200;
+const MAX_TRANSACTION_PAGES_DEFAULT = 2; // 1.000 transações
+const MAX_TRANSACTION_PAGES_FULL_HISTORY = 6; // 3.000 transações por conta (aprox. 5+ anos para usuário normal) - Evita Explosão de Memória/JSON
 const FULL_HISTORY_FROM_DATE = '1970-01-01';
 const FETCH_TIMEOUT_MS = 25000;
 
@@ -492,39 +492,52 @@ router.post('/sync', async (req, res) => {
             ? MAX_TRANSACTION_PAGES_FULL_HISTORY
             : MAX_TRANSACTION_PAGES_DEFAULT;
 
-        const enrichedAccounts = await Promise.all(accountsList.map(async (account) => {
-            let allTx = [];
-            let page = 1;
-            let hasMore = true;
+        const enrichedAccounts = [];
+        const CONCURRENT_ACCOUNTS = 3; // Limita a 3 contas simultâneas para evitar gargalo e limit rate da Pluggy
 
-            while (hasMore && page <= maxTransactionPages) {
-                const params = new URLSearchParams({
-                    accountId: account.id,
-                    pageSize: TRANSACTIONS_PAGE_SIZE.toString(),
-                    page: page.toString(),
-                    from: fromDate,
-                });
+        for (let i = 0; i < accountsList.length; i += CONCURRENT_ACCOUNTS) {
+            const batch = accountsList.slice(i, i + CONCURRENT_ACCOUNTS);
+            const batchResults = await Promise.all(batch.map(async (account) => {
+                let allTx = [];
+                let page = 1;
+                let hasMore = true;
 
-                const txRes = await pluggy.safeFetch(`${PLUGGY_API_URL}/transactions?${params}`);
-                const txData = txRes.ok ? await txRes.json() : { results: [], totalPages: page };
-                allTx = [...allTx, ...(txData.results || [])];
+                while (hasMore && page <= maxTransactionPages) {
+                    const params = new URLSearchParams({
+                        accountId: account.id,
+                        pageSize: TRANSACTIONS_PAGE_SIZE.toString(),
+                        page: page.toString(),
+                        from: fromDate,
+                    });
 
-                if (Number(txData.totalPages || 0) <= page) hasMore = false;
-                page += 1;
-            }
-            const truncatedByPageLimit = hasMore;
+                    const txRes = await pluggy.safeFetch(`${PLUGGY_API_URL}/transactions?${params}`);
+                    const txData = txRes.ok ? await txRes.json() : { results: [], totalPages: page };
+                    allTx = [...allTx, ...(txData.results || [])];
 
-            let bills = [];
-            if (account.type === 'CREDIT') {
-                const billsRes = await pluggy.safeFetch(`${PLUGGY_API_URL}/accounts/${account.id}/bills`);
-                if (billsRes.ok) {
-                    const billsPayload = await billsRes.json();
-                    bills = billsPayload.results || [];
+                    if (Number(txData.totalPages || 0) <= page) hasMore = false;
+                    page += 1;
                 }
-            }
+                const truncatedByPageLimit = hasMore;
 
-            return { ...account, transactions: allTx, bills, truncatedByPageLimit };
-        }));
+                let bills = [];
+                if (account.type === 'CREDIT') {
+                    const billsRes = await pluggy.safeFetch(`${PLUGGY_API_URL}/accounts/${account.id}/bills`);
+                    if (billsRes.ok) {
+                        const billsPayload = await billsRes.json();
+                        bills = billsPayload.results || [];
+                    }
+                }
+
+                return { ...account, transactions: allTx, bills, truncatedByPageLimit };
+            }));
+
+            enrichedAccounts.push(...batchResults);
+
+            if (i + CONCURRENT_ACCOUNTS < accountsList.length) {
+                // Pequena pausa entre os lotes para aliviar a API
+                await new Promise(resolve => setTimeout(resolve, 300));
+            }
+        }
 
         return res.json({
             success: true,
