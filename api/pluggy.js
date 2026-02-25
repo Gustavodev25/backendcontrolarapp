@@ -387,9 +387,17 @@ router.post('/create-item', async (req, res) => {
         const appRedirectUri = body.appRedirectUri || body.oauthRedirectUri || DEFAULT_APP_REDIRECT_URI;
         const callbackUrl = buildBackendOAuthCallbackUrl(req, appRedirectUri);
 
+        const reqCredentials = body.credentials || {};
+        const safeParameters = {};
+        for (const [key, value] of Object.entries(reqCredentials)) {
+            if (value !== null && value !== undefined && value !== '') {
+                safeParameters[key] = value;
+            }
+        }
+
         const payload = {
             connectorId: body.connectorId,
-            parameters: body.credentials || {},
+            parameters: safeParameters,
             clientUserId: req.currentUser,
             clientUrl: callbackUrl,
             ...(body.products && { products: body.products }),
