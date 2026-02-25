@@ -20,7 +20,9 @@ const DEFAULT_APP_REDIRECT_URI = 'controlarapp://open-finance/callback';
 const PLUGGY_WEBHOOK_IPS = ['177.71.238.212'];
 const PUBLIC_ROUTES = ['/webhook', '/ping', '/connectors', '/oauth-callback'];
 const TRANSACTIONS_PAGE_SIZE = 500;
-const MAX_TRANSACTION_PAGES = 10;
+const MAX_TRANSACTION_PAGES_DEFAULT = 10;
+const MAX_TRANSACTION_PAGES_FULL_HISTORY = 200;
+const FULL_HISTORY_FROM_DATE = '1970-01-01';
 const FETCH_TIMEOUT_MS = 25000;
 
 const normalizeUrlBase = (value) => String(value || '').trim().replace(/\/+$/, '');
@@ -483,16 +485,19 @@ router.post('/sync', async (req, res) => {
         const { results: accountsList = [] } = await accountsRes.json();
         const fromDate = from || (
             fullHistory
-                ? '2020-01-01'
+                ? FULL_HISTORY_FROM_DATE
                 : new Date(Date.now() - 90 * 24 * 60 * 60 * 1000).toISOString().split('T')[0]
         );
+        const maxTransactionPages = fullHistory
+            ? MAX_TRANSACTION_PAGES_FULL_HISTORY
+            : MAX_TRANSACTION_PAGES_DEFAULT;
 
         const enrichedAccounts = await Promise.all(accountsList.map(async (account) => {
             let allTx = [];
             let page = 1;
             let hasMore = true;
 
-            while (hasMore && page <= MAX_TRANSACTION_PAGES) {
+            while (hasMore && page <= maxTransactionPages) {
                 const params = new URLSearchParams({
                     accountId: account.id,
                     pageSize: TRANSACTIONS_PAGE_SIZE.toString(),
@@ -507,6 +512,7 @@ router.post('/sync', async (req, res) => {
                 if (Number(txData.totalPages || 0) <= page) hasMore = false;
                 page += 1;
             }
+            const truncatedByPageLimit = hasMore;
 
             let bills = [];
             if (account.type === 'CREDIT') {
@@ -517,7 +523,7 @@ router.post('/sync', async (req, res) => {
                 }
             }
 
-            return { ...account, transactions: allTx, bills };
+            return { ...account, transactions: allTx, bills, truncatedByPageLimit };
         }));
 
         return res.json({
@@ -528,6 +534,11 @@ router.post('/sync', async (req, res) => {
             connector: itemData.connector || null,
             accounts: enrichedAccounts,
             totalTransactions: enrichedAccounts.reduce((sum, account) => sum + (account.transactions?.length || 0), 0),
+            truncatedByPageLimit: enrichedAccounts.some((account) => account.truncatedByPageLimit === true),
+            syncWindow: {
+                from: fromDate,
+                fullHistory,
+            },
             syncedAt: new Date().toISOString(),
         });
     } catch (err) {
