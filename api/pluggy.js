@@ -415,15 +415,27 @@ router.post('/create-item', async (req, res) => {
             const alreadyUpdating =
                 data.codeDescription?.includes('ALREADY_UPDATING') ||
                 data.message?.includes('ALREADY_UPDATING');
+
+            let errorMessage = data.message || 'Falha ao conectar';
+            let extractedDetails = '';
+
+            if (data.details && Array.isArray(data.details) && data.details.length > 0) {
+                const detailMsgs = data.details.map(d => d.message).filter(Boolean);
+                if (detailMsgs.length > 0) {
+                    errorMessage = detailMsgs.join(' | ');
+                    extractedDetails = ` | Details: ${errorMessage}`;
+                }
+            }
+
             console.warn(
-                `[Pluggy Create Item] HTTP ${resp.status} | Connector: ${body.connectorId} | User: ${req.currentUser} | Code: ${data?.code || data?.codeDescription || 'N/A'} | Message: ${data?.message || 'N/A'}`
+                `[Pluggy Create Item] HTTP ${resp.status} | Connector: ${body.connectorId} | User: ${req.currentUser} | Code: ${data?.code || data?.codeDescription || 'N/A'} | Message: ${data?.message || 'N/A'}${extractedDetails}`
             );
 
             return res.status(resp.status).json({
                 success: false,
                 error: alreadyUpdating
                     ? 'Conexão já em andamento. Aguarde o webhook.'
-                    : (data.message || 'Falha ao conectar'),
+                    : errorMessage,
             });
         }
 
