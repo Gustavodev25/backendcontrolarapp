@@ -197,10 +197,10 @@ const pluggy = PluggyClient.getInstance();
 const createItemSchema = z.object({
     connectorId: z.union([z.string(), z.number()]),
     credentials: z.record(z.string(), z.any()).optional(),
-    oauthRedirectUri: z.string().url().optional(),
-    appRedirectUri: z.string().url().optional(),
+    oauthRedirectUri: z.string().optional(),
+    appRedirectUri: z.string().optional(),
     products: z.array(z.string().toUpperCase()).optional(),
-    webhookUrl: z.string().url().optional(),
+    webhookUrl: z.string().optional(),
 });
 
 const syncSchema = z.object({
