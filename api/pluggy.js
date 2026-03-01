@@ -546,6 +546,12 @@ router.post('/sync', async (req, res) => {
                         const billsPayload = await billsRes.json();
                         bills = billsPayload.results || [];
                     }
+                    // LOG: Capturar datas brutas do Pluggy para debug
+                    console.log(`[Pluggy Sync] CREDIT Account: ${account.name || account.id} | creditData:`, JSON.stringify(account.creditData || 'N/A'));
+                    console.log(`[Pluggy Sync] balanceCloseDate: ${account.creditData?.balanceCloseDate || 'NULL'} | balanceDueDate: ${account.creditData?.balanceDueDate || 'NULL'}`);
+                    if (bills.length > 0) {
+                        console.log(`[Pluggy Sync] Bills count: ${bills.length} | CurrentBill dueDate: ${bills[0]?.dueDate || 'NULL'} | closeDate: ${bills[0]?.date || bills[0]?.closeDate || 'NULL'}`);
+                    }
                 }
 
                 return { ...account, transactions: allTx, bills, truncatedByPageLimit };
