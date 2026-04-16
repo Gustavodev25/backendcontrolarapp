@@ -22,8 +22,14 @@ app.use(cors({
     allowedHeaders: ['Content-Type', 'Authorization', 'ngrok-skip-browser-warning']
 }));
 
-// Importante: garante a leitura correta do body em JSON (inclusive para os webhooks)
-app.use(express.json({ limit: '10kb' }));
+// Importante: garante a leitura correta do body em JSON
+// Stripe webhook precisa de raw body — NÃO parsear JSON no /api/stripe/webhook
+app.use((req, res, next) => {
+    if (req.originalUrl === '/api/stripe/webhook') {
+        return next();
+    }
+    express.json({ limit: '10kb' })(req, res, next);
+});
 
 app.use((req, res, next) => {
     const timestamp = new Date().toISOString();
@@ -61,6 +67,12 @@ try {
     app.use('/api/asaas', require('./api/asaas'));
 } catch (e) {
     // Ignora silenciosamente caso a rota asaas não exista
+}
+
+try {
+    app.use('/api/stripe', require('./api/stripe'));
+} catch (e) {
+    console.warn('[Server] Rota Stripe não carregada:', e.message);
 }
 
 app.use((err, req, res, next) => {
