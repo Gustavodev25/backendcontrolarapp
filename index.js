@@ -67,27 +67,8 @@ app.get('/api/diagnostics', (req, res) => {
 });
 
 app.use('/api/pluggy', pluggyRoutes);
-
-try {
-    app.use('/api/asaas', require('./api/asaas'));
-} catch (e) {
-    // Ignora silenciosamente caso a rota asaas não exista
-}
-
-try {
-    app.use('/api/stripe', require('./api/stripe'));
-    console.log('[Server] Rota Stripe carregada com sucesso ✅');
-} catch (e) {
-    console.error('[Server] ❌ Rota Stripe NÃO carregada:', e.message);
-    console.error('[Server] Verifique se STRIPE_SECRET_KEY está configurado nas variáveis de ambiente');
-}
-
-// Legacy: manter rota RevenueCat se existir (retrocompatibilidade)
-try {
-    app.use('/api/revenuecat', require('./api/revenuecat'));
-} catch (e) {
-    // Silenciosamente ignora se não existe
-}
+app.use('/api/stripe', require('./api/stripe'));
+console.log('[Server] Rota Stripe carregada ✅');
 
 app.use((err, req, res, next) => {
     const timestamp = new Date().toISOString();
