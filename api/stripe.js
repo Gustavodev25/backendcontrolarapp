@@ -21,10 +21,24 @@ const router = express.Router();
 const { getFirebaseAdmin } = require('../lib/firebaseAdmin');
 
 // ---------------------------------------------------------------------------
-// Stripe Init
+// Stripe Init (lazy — prevents module load failure when env var is missing)
 // ---------------------------------------------------------------------------
 
-const stripe = require('stripe')(process.env.STRIPE_SECRET_KEY);
+let _stripe = null;
+function getStripe() {
+    if (!_stripe) {
+        if (!process.env.STRIPE_SECRET_KEY) {
+            throw new Error('STRIPE_SECRET_KEY não configurado nas variáveis de ambiente do servidor');
+        }
+        _stripe = require('stripe')(process.env.STRIPE_SECRET_KEY);
+    }
+    return _stripe;
+}
+const stripe = new Proxy({}, {
+    get(_, prop) {
+        return getStripe()[prop];
+    }
+});
 
 // ---------------------------------------------------------------------------
 // Helpers

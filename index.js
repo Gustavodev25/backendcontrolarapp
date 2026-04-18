@@ -71,8 +71,10 @@ try {
 
 try {
     app.use('/api/stripe', require('./api/stripe'));
+    console.log('[Server] Rota Stripe carregada com sucesso ✅');
 } catch (e) {
-    console.warn('[Server] Rota Stripe não carregada:', e.message);
+    console.error('[Server] ❌ Rota Stripe NÃO carregada:', e.message);
+    console.error('[Server] Verifique se STRIPE_SECRET_KEY está configurado nas variáveis de ambiente');
 }
 
 // Legacy: manter rota RevenueCat se existir (retrocompatibilidade)
