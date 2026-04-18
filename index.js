@@ -38,7 +38,12 @@ app.use((req, res, next) => {
 });
 
 app.get('/health', (req, res) => {
-    res.json({ status: 'ok', timestamp: new Date().toISOString() });
+    res.json({
+        status: 'ok',
+        timestamp: new Date().toISOString(),
+        stripe: process.env.STRIPE_SECRET_KEY ? 'configured' : 'missing',
+        firebase: require('./lib/firebaseAdmin').isFirebaseConfigured() ? 'connected' : 'missing',
+    });
 });
 
 app.get('/api/diagnostics', (req, res) => {
