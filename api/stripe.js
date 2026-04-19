@@ -249,13 +249,23 @@ router.post('/create-subscription', async (req, res) => {
         });
 
         if (existingSubs.data.length > 0) {
-            // Já tem assinatura ativa
             return res.json({
                 success: true,
                 alreadyActive: true,
                 subscriptionId: existingSubs.data[0].id,
                 message: 'Assinatura já está ativa',
             });
+        }
+
+        // Cancela assinaturas incompletas anteriores para evitar duplicatas
+        const incompleteSubs = await stripe.subscriptions.list({
+            customer: customer.id,
+            status: 'incomplete',
+            limit: 5,
+        });
+        for (const sub of incompleteSubs.data) {
+            await stripe.subscriptions.cancel(sub.id);
+            console.log(`[Stripe] Assinatura incompleta cancelada: ${sub.id}`);
         }
 
         // 5. Cria a assinatura
