@@ -323,6 +323,14 @@ router.post('/create-subscription', async (req, res) => {
         });
     } catch (error) {
         console.error('[Stripe] Erro ao criar assinatura:', error);
+
+        // Erro específico de cupom não aplicável ao cliente
+        if (error.param === 'promotion_code' || error.param === 'coupon') {
+            return res.status(400).json({
+                error: 'Este cupom não pode ser usado nesta conta. Verifique as condições de uso do cupom.',
+            });
+        }
+
         res.status(500).json({ error: error.message });
     }
 });
