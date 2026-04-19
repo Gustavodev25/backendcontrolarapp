@@ -268,14 +268,15 @@ router.post('/create-subscription', async (req, res) => {
             console.log(`[Stripe] Assinatura incompleta cancelada: ${sub.id}`);
         }
 
-        // 5. Cria a assinatura
+        // 5. Cria a assinatura — cobra imediatamente ou falha
         const subscriptionParams = {
             customer: customer.id,
             items: [{ price: priceId }],
             default_payment_method: paymentMethodId,
-            payment_behavior: 'default_incomplete',
+            payment_behavior: 'error_if_incomplete',
             payment_settings: {
                 save_default_payment_method: 'on_subscription',
+                payment_method_types: ['card'],
             },
             expand: ['latest_invoice.payment_intent'],
             metadata: { firebaseUid },
@@ -292,13 +293,15 @@ router.post('/create-subscription', async (req, res) => {
         const invoice = subscription.latest_invoice;
         const paymentIntent = invoice?.payment_intent;
 
-        // Se a assinatura já está ativa (pagamento instantâneo com Apple Pay)
+        // Assinatura ativa (cobrança bem-sucedida ou desconto 100%)
         if (subscription.status === 'active') {
+            const paidAmount = invoice?.amount_paid != null ? invoice.amount_paid / 100 : 35.90;
+
             await updateSubscriptionInFirebase(firebaseUid, {
                 plan: 'pro',
                 status: 'active',
                 billingCycle: 'monthly',
-                price: 35.90,
+                price: paidAmount,
                 startedAt: new Date(subscription.start_date * 1000),
                 expiresAt: new Date(subscription.current_period_end * 1000),
                 nextBillingDate: new Date(subscription.current_period_end * 1000).toISOString().split('T')[0],
@@ -315,21 +318,22 @@ router.post('/create-subscription', async (req, res) => {
             });
         }
 
-        // Se precisa de confirmação adicional (3D Secure, etc)
-        if (paymentIntent) {
+        // 3D Secure necessário
+        if (paymentIntent && paymentIntent.status === 'requires_action') {
             return res.json({
                 success: true,
                 status: subscription.status,
                 subscriptionId: subscription.id,
                 clientSecret: paymentIntent.client_secret,
-                requiresAction: paymentIntent.status === 'requires_action',
+                requiresAction: true,
             });
         }
 
         return res.json({
-            success: true,
+            success: false,
             status: subscription.status,
             subscriptionId: subscription.id,
+            error: 'Pagamento não confirmado. Tente novamente.',
         });
     } catch (error) {
         console.error('[Stripe] Erro ao criar assinatura:', error);
