@@ -118,14 +118,82 @@ async function getOrCreateStripeCustomer(firebaseUid, email, name) {
 }
 
 // ---------------------------------------------------------------------------
+// POST /validate-coupon
+// Valida um cupom ou código promocional do Stripe
+// Body: { code }
+// ---------------------------------------------------------------------------
+
+router.post('/validate-coupon', async (req, res) => {
+    try {
+        const { code } = req.body;
+
+        if (!code || typeof code !== 'string') {
+            return res.status(400).json({ error: 'Código inválido' });
+        }
+
+        const normalizedCode = code.trim().toUpperCase();
+
+        // Tenta como promotion code (código visível ao usuário, ex: "DESCONTO20")
+        const promoCodes = await stripe.promotionCodes.list({
+            code: normalizedCode,
+            active: true,
+            limit: 1,
+        });
+
+        if (promoCodes.data.length > 0) {
+            const promo = promoCodes.data[0];
+            const coupon = promo.coupon;
+
+            if (!coupon.valid) {
+                return res.status(400).json({ valid: false, error: 'Cupom expirado ou inválido' });
+            }
+
+            return res.json({
+                valid: true,
+                promotionCodeId: promo.id,
+                couponId: coupon.id,
+                percentOff: coupon.percent_off || null,
+                amountOff: coupon.amount_off ? coupon.amount_off / 100 : null,
+                currency: coupon.currency || null,
+                name: coupon.name || normalizedCode,
+            });
+        }
+
+        // Tenta como coupon ID direto
+        try {
+            const coupon = await stripe.coupons.retrieve(normalizedCode);
+            if (!coupon.valid) {
+                return res.status(400).json({ valid: false, error: 'Cupom expirado ou inválido' });
+            }
+
+            return res.json({
+                valid: true,
+                couponId: coupon.id,
+                percentOff: coupon.percent_off || null,
+                amountOff: coupon.amount_off ? coupon.amount_off / 100 : null,
+                currency: coupon.currency || null,
+                name: coupon.name || normalizedCode,
+            });
+        } catch {
+            // Coupon não encontrado
+        }
+
+        return res.status(404).json({ valid: false, error: 'Cupom não encontrado' });
+    } catch (error) {
+        console.error('[Stripe] Erro ao validar cupom:', error);
+        res.status(500).json({ error: error.message });
+    }
+});
+
+// ---------------------------------------------------------------------------
 // POST /create-subscription
 // Cria uma assinatura Stripe com Payment Method (para Apple Pay / Card)
-// Body: { firebaseUid, email, name?, paymentMethodId }
+// Body: { firebaseUid, email, name?, paymentMethodId, promotionCodeId?, couponId? }
 // ---------------------------------------------------------------------------
 
 router.post('/create-subscription', async (req, res) => {
     try {
-        const { firebaseUid, email, paymentMethodId: rawPaymentMethodId, name } = req.body;
+        const { firebaseUid, email, paymentMethodId: rawPaymentMethodId, name, promotionCodeId, couponId } = req.body;
 
         if (!firebaseUid || !email || !rawPaymentMethodId) {
             return res.status(400).json({
@@ -191,7 +259,7 @@ router.post('/create-subscription', async (req, res) => {
         }
 
         // 5. Cria a assinatura
-        const subscription = await stripe.subscriptions.create({
+        const subscriptionParams = {
             customer: customer.id,
             items: [{ price: priceId }],
             default_payment_method: paymentMethodId,
@@ -201,7 +269,15 @@ router.post('/create-subscription', async (req, res) => {
             },
             expand: ['latest_invoice.payment_intent'],
             metadata: { firebaseUid },
-        });
+        };
+
+        if (promotionCodeId) {
+            subscriptionParams.discounts = [{ promotion_code: promotionCodeId }];
+        } else if (couponId) {
+            subscriptionParams.discounts = [{ coupon: couponId }];
+        }
+
+        const subscription = await stripe.subscriptions.create(subscriptionParams);
 
         const invoice = subscription.latest_invoice;
         const paymentIntent = invoice?.payment_intent;
