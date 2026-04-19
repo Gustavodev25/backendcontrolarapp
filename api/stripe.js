@@ -148,6 +148,10 @@ router.post('/validate-coupon', async (req, res) => {
                 return res.status(400).json({ valid: false, error: 'Cupom expirado ou inválido' });
             }
 
+            if (coupon.percent_off === 100) {
+                return res.status(400).json({ valid: false, error: 'Este cupom não é válido para assinaturas.' });
+            }
+
             return res.json({
                 valid: true,
                 promotionCodeId: promo.id,
@@ -164,6 +168,10 @@ router.post('/validate-coupon', async (req, res) => {
             const coupon = await stripe.coupons.retrieve(normalizedCode);
             if (!coupon.valid) {
                 return res.status(400).json({ valid: false, error: 'Cupom expirado ou inválido' });
+            }
+
+            if (coupon.percent_off === 100) {
+                return res.status(400).json({ valid: false, error: 'Este cupom não é válido para assinaturas.' });
             }
 
             return res.json({
@@ -214,11 +222,16 @@ router.post('/create-subscription', async (req, res) => {
         let paymentMethodId = rawPaymentMethodId;
 
         if (paymentMethodId.startsWith('seti_')) {
-            const setupIntent = await stripe.setupIntents.retrieve(paymentMethodId);
+            const setupIntent = await stripe.setupIntents.retrieve(paymentMethodId, {
+                expand: ['payment_method'],
+            });
+            // Aceita tanto 'succeeded' quanto 'requires_confirmation' (já confirmado pela Payment Sheet)
             if (!setupIntent.payment_method) {
                 return res.status(400).json({ error: 'SetupIntent não possui payment method confirmado' });
             }
-            paymentMethodId = setupIntent.payment_method;
+            paymentMethodId = typeof setupIntent.payment_method === 'string'
+                ? setupIntent.payment_method
+                : setupIntent.payment_method.id;
             console.log(`[Stripe] Resolvido PM do SetupIntent: ${paymentMethodId}`);
         }
 
@@ -242,11 +255,18 @@ router.post('/create-subscription', async (req, res) => {
         });
 
         // 4. Verifica se já tem assinatura ativa
-        const existingSubs = await stripe.subscriptions.list({
-            customer: customer.id,
-            status: 'active',
-            limit: 1,
-        });
+        let existingSubs = { data: [] };
+        let incompleteSubs = { data: [] };
+        try {
+            existingSubs = await stripe.subscriptions.list({
+                customer: customer.id,
+                status: 'active',
+                limit: 1,
+            });
+        } catch (err) {
+            if (err.code !== 'resource_missing') throw err;
+            console.warn(`[Stripe] Customer não encontrado ao listar assinaturas ativas: ${customer.id}`);
+        }
 
         if (existingSubs.data.length > 0) {
             return res.json({
@@ -258,11 +278,16 @@ router.post('/create-subscription', async (req, res) => {
         }
 
         // Cancela assinaturas incompletas anteriores para evitar duplicatas
-        const incompleteSubs = await stripe.subscriptions.list({
-            customer: customer.id,
-            status: 'incomplete',
-            limit: 5,
-        });
+        try {
+            incompleteSubs = await stripe.subscriptions.list({
+                customer: customer.id,
+                status: 'incomplete',
+                limit: 5,
+            });
+        } catch (err) {
+            if (err.code !== 'resource_missing') throw err;
+            console.warn(`[Stripe] Customer não encontrado ao listar assinaturas incompletas: ${customer.id}`);
+        }
         for (const sub of incompleteSubs.data) {
             await stripe.subscriptions.cancel(sub.id);
             console.log(`[Stripe] Assinatura incompleta cancelada: ${sub.id}`);
@@ -293,15 +318,22 @@ router.post('/create-subscription', async (req, res) => {
         const invoice = subscription.latest_invoice;
         const paymentIntent = invoice?.payment_intent;
 
-        // Assinatura ativa (cobrança bem-sucedida ou desconto 100%)
+        // Assinatura ativa — garante que houve cobrança real
         if (subscription.status === 'active') {
             const paidAmount = invoice?.amount_paid != null ? invoice.amount_paid / 100 : 35.90;
+
+            if (paidAmount === 0) {
+                // Cancela a assinatura gratuita imediatamente para evitar acesso indevido
+                await stripe.subscriptions.cancel(subscription.id);
+                console.warn(`[Stripe] Assinatura cancelada por cobrança zero: ${subscription.id}`);
+                return res.status(400).json({ error: 'Não foi possível processar o pagamento. Verifique seu cartão e tente novamente.' });
+            }
 
             await updateSubscriptionInFirebase(firebaseUid, {
                 plan: 'pro',
                 status: 'active',
                 billingCycle: 'monthly',
-                price: paidAmount,
+                price: 35.90,
                 startedAt: new Date(subscription.start_date * 1000),
                 expiresAt: new Date(subscription.current_period_end * 1000),
                 nextBillingDate: new Date(subscription.current_period_end * 1000).toISOString().split('T')[0],
