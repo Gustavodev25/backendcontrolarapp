@@ -68,7 +68,8 @@ app.get('/api/diagnostics', (req, res) => {
 
 app.use('/api/pluggy', pluggyRoutes);
 app.use('/api/stripe', require('./api/stripe'));
-console.log('[Server] Rota Stripe carregada ✅');
+app.use('/api/apple', require('./api/apple'));
+console.log('[Server] Rotas Stripe e Apple IAP carregadas ✅');
 
 app.use((err, req, res, next) => {
     const timestamp = new Date().toISOString();
