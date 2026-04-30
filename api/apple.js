@@ -5,7 +5,7 @@ const { getFirebaseAdmin } = require('../lib/firebaseAdmin');
 const fetch = global.fetch || require('node-fetch');
 
 const PRO_PRODUCT_ID = 'com.gustavodev25.controlarapp.pro.monthly';
-const PRO_PRICE = 35.90;
+const PRO_PRICE = 34.90;
 const PRO_CURRENCY = 'BRL';
 const APPLE_PRODUCTION_VERIFY_URL = 'https://buy.itunes.apple.com/verifyReceipt';
 const APPLE_SANDBOX_VERIFY_URL = 'https://sandbox.itunes.apple.com/verifyReceipt';
