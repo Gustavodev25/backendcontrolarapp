@@ -2,13 +2,16 @@ const express = require('express');
 const fetch = require('node-fetch');
 const { z } = require('zod');
 const { getFirebaseAdmin, isFirebaseConfigured } = require('../lib/firebaseAdmin');
+const {
+    normalizePluggyError,
+    readResponseBody,
+} = require('./pluggy.helpers');
 
 const router = express.Router();
 
-// ====================== VALIDAÇÃO DE AMBIENTE ======================
 const envSchema = z.object({
-    PLUGGY_CLIENT_ID: z.string().min(1, 'PLUGGY_CLIENT_ID obrigatório'),
-    PLUGGY_CLIENT_SECRET: z.string().min(1, 'PLUGGY_CLIENT_SECRET obrigatório'),
+    PLUGGY_CLIENT_ID: z.string().min(1, 'PLUGGY_CLIENT_ID obrigatorio'),
+    PLUGGY_CLIENT_SECRET: z.string().min(1, 'PLUGGY_CLIENT_SECRET obrigatorio'),
     PLUGGY_SANDBOX: z.enum(['true', 'false']).optional().default('false'),
 });
 
@@ -20,10 +23,12 @@ const DEFAULT_APP_REDIRECT_URI = 'controlarapp://open-finance/callback';
 const PLUGGY_WEBHOOK_IPS = ['177.71.238.212'];
 const PUBLIC_ROUTES = ['/webhook', '/ping', '/connectors', '/oauth-callback'];
 const TRANSACTIONS_PAGE_SIZE = 500;
-const MAX_TRANSACTION_PAGES_DEFAULT = 2; // 1.000 transações
-const MAX_TRANSACTION_PAGES_FULL_HISTORY = 6; // 3.000 transações por conta (aprox. 5+ anos para usuário normal) - Evita Explosão de Memória/JSON
+const MAX_TRANSACTION_PAGES_DEFAULT = 2;
+const MAX_TRANSACTION_PAGES_FULL_HISTORY = 6;
 const FULL_HISTORY_FROM_DATE = '1970-01-01';
 const FETCH_TIMEOUT_MS = 25000;
+const AUTH_TOKEN_TTL_MS = 2 * 60 * 60 * 1000;
+const AUTH_TOKEN_REFRESH_SKEW_MS = 5 * 60 * 1000;
 
 const normalizeUrlBase = (value) => String(value || '').trim().replace(/\/+$/, '');
 
@@ -51,8 +56,7 @@ const getRequestBaseUrl = (req) => {
 const toValidAppRedirectUri = (candidate) => {
     if (!candidate) return DEFAULT_APP_REDIRECT_URI;
     try {
-        const parsed = new URL(candidate);
-        return parsed.toString();
+        return new URL(candidate).toString();
     } catch {
         return DEFAULT_APP_REDIRECT_URI;
     }
@@ -90,9 +94,9 @@ const renderOAuthRedirectPage = (redirectUrl) => `<!DOCTYPE html>
 <body>
   <div class="card">
     <div class="spinner"></div>
-    <h2>Autorização recebida</h2>
-    <p>Estamos retornando você para o app.</p>
-    <p>Se não abrir automaticamente, toque no link:</p>
+    <h2>Autorizacao recebida</h2>
+    <p>Estamos retornando voce para o app.</p>
+    <p>Se nao abrir automaticamente, toque no link:</p>
     <p><a href="${escapeHtml(redirectUrl)}">${escapeHtml(redirectUrl)}</a></p>
   </div>
   <script>
@@ -116,7 +120,6 @@ const getClientIp = (req) => {
 
 const isLocalIp = (ip) => ['127.0.0.1', '::1', 'localhost'].includes(ip);
 
-// ====================== CLIENT PLUGGY ======================
 class PluggyClient {
     static instance;
     token = null;
@@ -129,38 +132,56 @@ class PluggyClient {
     }
 
     async getToken() {
-        if (this.token && this.expiry && Date.now() < this.expiry - 5 * 60 * 1000) return this.token;
+        if (this.token && this.expiry && Date.now() < this.expiry - AUTH_TOKEN_REFRESH_SKEW_MS) {
+            return this.token;
+        }
         if (this.refreshing) return this.refreshing;
 
         this.refreshing = (async () => {
-            const res = await this.safeFetch(`${PLUGGY_API_URL}/auth`, {
-                method: 'POST',
-                headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({
-                    clientId: env.PLUGGY_CLIENT_ID,
-                    clientSecret: env.PLUGGY_CLIENT_SECRET,
-                }),
-            });
+            try {
+                const res = await this.safeFetch(`${PLUGGY_API_URL}/auth`, {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({
+                        clientId: env.PLUGGY_CLIENT_ID,
+                        clientSecret: env.PLUGGY_CLIENT_SECRET,
+                    }),
+                });
 
-            if (!res.ok) throw new Error('Falha na autenticação Pluggy');
-            const data = await res.json();
+                const data = await readResponseBody(res);
+                if (!res.ok || !data?.apiKey) {
+                    const normalized = normalizePluggyError({
+                        status: res.status,
+                        payload: data,
+                        fallbackMessage: 'Falha na autenticacao Pluggy',
+                    });
+                    throw new Error(normalized.error);
+                }
 
-            this.token = data.apiKey;
-            this.expiry = Date.now() + 2 * 60 * 60 * 1000;
-            this.refreshing = null;
-            return this.token;
+                this.token = data.apiKey;
+                this.expiry = Date.now() + AUTH_TOKEN_TTL_MS;
+                return this.token;
+            } finally {
+                this.refreshing = null;
+            }
         })();
 
         return this.refreshing;
+    }
+
+    invalidateToken() {
+        this.token = null;
+        this.expiry = null;
     }
 
     async safeFetch(url, options = {}, retries = 3) {
         for (let attempt = 1; attempt <= retries; attempt++) {
             const controller = new AbortController();
             const timeout = setTimeout(() => controller.abort(), FETCH_TIMEOUT_MS);
+            const isAuthRequest = url.includes('/auth');
 
             try {
-                const token = url.includes('/auth') ? null : await this.getToken();
+                const token = isAuthRequest ? null : await this.getToken();
                 const response = await fetch(url, {
                     ...options,
                     signal: controller.signal,
@@ -172,16 +193,29 @@ class PluggyClient {
 
                 clearTimeout(timeout);
 
-                if (response.status === 429 || response.status >= 500) {
+                if (response.status === 401 && !isAuthRequest && attempt < retries) {
+                    this.invalidateToken();
+                    await this.delay(250);
+                    continue;
+                }
+
+                if (
+                    response.status === 408 ||
+                    response.status === 409 ||
+                    response.status === 425 ||
+                    response.status === 429 ||
+                    response.status >= 500
+                ) {
                     if (attempt === retries) return response;
                     await this.delay(attempt * 1000 + Math.random() * 800);
                     continue;
                 }
+
                 return response;
             } catch (err) {
                 clearTimeout(timeout);
                 if (attempt === retries) throw err;
-                await this.delay(attempt * 1000);
+                await this.delay(attempt * 1000 + Math.random() * 500);
             }
         }
     }
@@ -193,7 +227,6 @@ class PluggyClient {
 
 const pluggy = PluggyClient.getInstance();
 
-// ====================== SCHEMAS ======================
 const createItemSchema = z.object({
     connectorId: z.union([z.string(), z.number()]),
     credentials: z.record(z.string(), z.any()).optional(),
@@ -205,28 +238,75 @@ const createItemSchema = z.object({
 
 const syncSchema = z.object({
     itemId: z.string().uuid(),
-    from: z.string().datetime({ offset: true }).optional(),
+    from: z.string().min(4).optional(),
     fullHistory: z.boolean().optional().default(false),
     autoRefresh: z.boolean().optional().default(false),
 });
 
 const paramIdSchema = z.object({ id: z.string().uuid() });
 
+const buildErrorResponse = (status, payload, fallbackMessage, fallbackCode = null) => {
+    const normalized = normalizePluggyError({
+        status,
+        payload,
+        fallbackMessage,
+        fallbackCode,
+    });
+
+    return {
+        status: status >= 400 && status < 600 ? status : 502,
+        body: normalized,
+    };
+};
+
+const sendPluggyError = async (res, response, fallbackMessage, fallbackCode = null) => {
+    const payload = await readResponseBody(response);
+    const normalized = buildErrorResponse(
+        response?.status || 502,
+        payload,
+        fallbackMessage,
+        fallbackCode
+    );
+    return res.status(normalized.status).json(normalized.body);
+};
+
 const mapItemOwnershipError = (err) => {
     if (err && typeof err === 'object' && 'status' in err && 'message' in err) {
-        return err;
+        return {
+            status: err.status,
+            body: {
+                success: false,
+                error: err.message,
+                errorCode: err.errorCode || 'ITEM_VALIDATION_FAILED',
+                retryable: err.retryable === true,
+                actionRequired: err.actionRequired === true,
+            },
+        };
     }
-    return { status: 500, message: 'Erro ao validar item' };
+
+    return {
+        status: 500,
+        body: {
+            success: false,
+            error: 'Erro ao validar item',
+            errorCode: 'ITEM_VALIDATION_FAILED',
+            retryable: true,
+            actionRequired: false,
+        },
+    };
 };
 
 const extractItemErrorSnapshot = (item) => {
     const error = item?.error && typeof item.error === 'object' ? item.error : {};
+    const statusDetail = item?.statusDetail && typeof item.statusDetail === 'object' ? item.statusDetail : {};
+    const statusDetailError = statusDetail?.error && typeof statusDetail.error === 'object' ? statusDetail.error : {};
+
     return {
         status: item?.status || null,
         executionStatus: item?.executionStatus || null,
-        errorCode: error?.code || null,
-        errorMessage: error?.message || null,
-        providerMessage: error?.providerMessage || null,
+        errorCode: error?.code || statusDetailError?.code || item?.errorCode || null,
+        errorMessage: error?.message || statusDetailError?.message || item?.message || null,
+        providerMessage: error?.providerMessage || statusDetailError?.providerMessage || null,
         connector: item?.connector?.name || null,
         updatedAt: item?.updatedAt || null,
     };
@@ -234,6 +314,7 @@ const extractItemErrorSnapshot = (item) => {
 
 const logItemDiagnostics = async (source, event, itemId) => {
     if (!itemId) return;
+
     try {
         const itemRes = await pluggy.safeFetch(`${PLUGGY_API_URL}/items/${itemId}`);
         if (!itemRes.ok) {
@@ -241,7 +322,7 @@ const logItemDiagnostics = async (source, event, itemId) => {
             return;
         }
 
-        const item = await itemRes.json();
+        const item = await readResponseBody(itemRes);
         const snapshot = extractItemErrorSnapshot(item);
 
         console.warn(
@@ -258,19 +339,160 @@ const logItemDiagnostics = async (source, event, itemId) => {
 const ensureItemOwnership = async (itemId, expectedUserId) => {
     const itemRes = await pluggy.safeFetch(`${PLUGGY_API_URL}/items/${itemId}`);
     if (!itemRes.ok) {
-        const status = itemRes.status === 404 ? 404 : 502;
-        throw { status, message: 'Item não encontrado' };
+        const payload = await readResponseBody(itemRes);
+        const normalized = buildErrorResponse(
+            itemRes.status === 404 ? 404 : itemRes.status,
+            payload,
+            itemRes.status === 404 ? 'Item nao encontrado' : 'Erro ao validar item',
+            itemRes.status === 404 ? 'ITEM_NOT_FOUND' : 'ITEM_OWNERSHIP_CHECK_FAILED'
+        );
+        throw {
+            status: normalized.status,
+            message: normalized.body.error,
+            errorCode: normalized.body.errorCode,
+            retryable: normalized.body.retryable,
+            actionRequired: normalized.body.actionRequired,
+        };
     }
 
-    const item = await itemRes.json();
+    const item = await readResponseBody(itemRes);
     if (!item?.clientUserId || item.clientUserId !== expectedUserId) {
-        throw { status: 403, message: 'Acesso negado para este item' };
+        throw {
+            status: 403,
+            message: 'Acesso negado para este item',
+            errorCode: 'ITEM_FORBIDDEN',
+            retryable: false,
+            actionRequired: false,
+        };
     }
 
     return item;
 };
 
-// ====================== MIDDLEWARE DE AUTENTICAÇÃO ======================
+const buildItemStateError = (item) => {
+    const status = String(item?.status || '').toUpperCase();
+    const snapshot = extractItemErrorSnapshot(item);
+
+    if (status === 'WAITING_USER_INPUT') {
+        return {
+            status: 409,
+            body: {
+                success: false,
+                error: 'Aguardando autorizacao do banco.',
+                errorCode: snapshot.errorCode || 'WAITING_USER_INPUT',
+                retryable: true,
+                actionRequired: true,
+                itemStatus: item?.status || null,
+            },
+        };
+    }
+
+    if (status === 'UPDATING' || status === 'PROCESSING') {
+        return {
+            status: 409,
+            body: {
+                success: false,
+                error: 'O banco ainda esta processando a atualizacao.',
+                errorCode: snapshot.errorCode || 'ITEM_UPDATING',
+                retryable: true,
+                actionRequired: false,
+                itemStatus: item?.status || null,
+            },
+        };
+    }
+
+    if (status === 'LOGIN_ERROR' || status === 'OUTDATED' || status === 'ERROR') {
+        const normalized = normalizePluggyError({
+            status: 409,
+            payload: {
+                code: snapshot.errorCode || status,
+                message: snapshot.providerMessage || snapshot.errorMessage,
+            },
+            fallbackMessage: 'O banco recusou a conexao.',
+        });
+        return {
+            status: 409,
+            body: {
+                ...normalized,
+                retryable: false,
+                actionRequired: true,
+                itemStatus: item?.status || null,
+            },
+        };
+    }
+
+    return null;
+};
+
+const enrichAccount = async (account, fromDate, maxTransactionPages) => {
+    let allTx = [];
+    let page = 1;
+    let hasMore = true;
+
+    while (hasMore && page <= maxTransactionPages) {
+        const params = new URLSearchParams({
+            accountId: account.id,
+            pageSize: TRANSACTIONS_PAGE_SIZE.toString(),
+            page: page.toString(),
+            from: fromDate,
+        });
+
+        const txRes = await pluggy.safeFetch(`${PLUGGY_API_URL}/transactions?${params}`);
+        if (!txRes.ok) {
+            const payload = await readResponseBody(txRes);
+            const normalized = buildErrorResponse(
+                txRes.status,
+                payload,
+                'Erro ao buscar transacoes da conta',
+                'TRANSACTIONS_FETCH_FAILED'
+            );
+            throw {
+                stage: 'transactions',
+                accountId: account.id,
+                accountName: account.name || null,
+                ...normalized.body,
+            };
+        }
+
+        const txData = await readResponseBody(txRes);
+        allTx = allTx.concat(Array.isArray(txData?.results) ? txData.results : []);
+
+        if (Number(txData?.totalPages || 0) <= page) hasMore = false;
+        page += 1;
+    }
+
+    const truncatedByPageLimit = hasMore;
+    let bills = [];
+    let billError = null;
+
+    if (account.type === 'CREDIT') {
+        const billsRes = await pluggy.safeFetch(`${PLUGGY_API_URL}/accounts/${account.id}/bills`);
+        if (billsRes.ok) {
+            const billsPayload = await readResponseBody(billsRes);
+            bills = Array.isArray(billsPayload?.results) ? billsPayload.results : [];
+        } else {
+            const payload = await readResponseBody(billsRes);
+            const normalized = buildErrorResponse(
+                billsRes.status,
+                payload,
+                'Erro ao buscar faturas da conta',
+                'BILLS_FETCH_FAILED'
+            );
+            billError = {
+                stage: 'bills',
+                accountId: account.id,
+                accountName: account.name || null,
+                ...normalized.body,
+            };
+        }
+    }
+
+    return {
+        account: { ...account, transactions: allTx, bills, truncatedByPageLimit },
+        billError,
+    };
+};
+
 const enforceUser = async (req, res, next) => {
     if (PUBLIC_ROUTES.some((route) => req.path.startsWith(route))) {
         return next();
@@ -279,13 +501,22 @@ const enforceUser = async (req, res, next) => {
     if (!isFirebaseConfigured()) {
         return res.status(500).json({
             success: false,
-            error: 'Firebase Admin não configurado no servidor'
+            error: 'Firebase Admin nao configurado no servidor',
+            errorCode: 'FIREBASE_ADMIN_MISSING',
+            retryable: false,
+            actionRequired: false,
         });
     }
 
     const authHeader = req.headers.authorization;
     if (!authHeader || !authHeader.startsWith('Bearer ')) {
-        return res.status(401).json({ success: false, error: 'Token de autenticação ausente' });
+        return res.status(401).json({
+            success: false,
+            error: 'Token de autenticacao ausente',
+            errorCode: 'AUTH_TOKEN_MISSING',
+            retryable: false,
+            actionRequired: true,
+        });
     }
 
     try {
@@ -295,14 +526,19 @@ const enforceUser = async (req, res, next) => {
         req.user = decodedToken;
         req.currentUser = decodedToken.uid;
         return next();
-    } catch (error) {
-        return res.status(401).json({ success: false, error: 'Token inválido ou expirado' });
+    } catch {
+        return res.status(401).json({
+            success: false,
+            error: 'Token invalido ou expirado',
+            errorCode: 'AUTH_TOKEN_INVALID',
+            retryable: false,
+            actionRequired: true,
+        });
     }
 };
 
 router.use(enforceUser);
 
-// ====================== ROTAS PÚBLICAS ======================
 router.get('/ping', (req, res) => {
     res.json({ status: 'ok', timestamp: new Date().toISOString() });
 });
@@ -311,12 +547,17 @@ router.get('/connectors', async (req, res) => {
     try {
         const resp = await pluggy.safeFetch(`${PLUGGY_API_URL}/connectors?sandbox=${env.PLUGGY_SANDBOX}&types=PERSONAL_BANK,BUSINESS_BANK`);
         if (!resp.ok) {
-            const errData = await resp.text();
-            throw new Error(`HTTP ${resp.status} - ${errData}`);
+            return sendPluggyError(res, resp, 'Servico temporariamente indisponivel', 'CONNECTORS_FETCH_FAILED');
         }
-        res.json(await resp.json());
+        res.json(await readResponseBody(resp));
     } catch (err) {
-        res.status(502).json({ success: false, error: 'Serviço temporariamente indisponível' });
+        res.status(502).json({
+            success: false,
+            error: err?.message || 'Servico temporariamente indisponivel',
+            errorCode: 'CONNECTORS_FETCH_FAILED',
+            retryable: true,
+            actionRequired: false,
+        });
     }
 });
 
@@ -332,9 +573,8 @@ router.get('/oauth-callback', async (req, res) => {
         if (status) redirectUrl.searchParams.set('status', status);
         if (error) redirectUrl.searchParams.set('error', error);
 
-        const finalUrl = redirectUrl.toString();
-        res.status(200).send(renderOAuthRedirectPage(finalUrl));
-    } catch (err) {
+        res.status(200).send(renderOAuthRedirectPage(redirectUrl.toString()));
+    } catch {
         res.status(500).json({ success: false, error: 'Falha ao processar callback OAuth' });
     }
 });
@@ -380,7 +620,6 @@ router.post('/webhook', async (req, res) => {
     }
 });
 
-// ====================== ROTAS AUTENTICADAS ======================
 router.post('/create-item', async (req, res) => {
     try {
         const body = createItemSchema.parse(req.body);
@@ -407,54 +646,55 @@ router.post('/create-item', async (req, res) => {
         const resp = await pluggy.safeFetch(`${PLUGGY_API_URL}/items`, {
             method: 'POST',
             body: JSON.stringify(payload),
-            headers: { 'Content-Type': 'application/json' }
+            headers: { 'Content-Type': 'application/json' },
         });
 
-        const data = await resp.json();
+        const data = await readResponseBody(resp);
         if (!resp.ok) {
+            const normalized = normalizePluggyError({
+                status: resp.status,
+                payload: data,
+                fallbackMessage: 'Falha ao conectar',
+                fallbackCode: 'CREATE_ITEM_FAILED',
+            });
             const alreadyUpdating =
-                data.codeDescription?.includes('ALREADY_UPDATING') ||
-                data.message?.includes('ALREADY_UPDATING');
-
-            let errorMessage = data.message || 'Falha ao conectar';
-            let extractedDetails = '';
-
-            if (data.details && Array.isArray(data.details) && data.details.length > 0) {
-                const detailMsgs = data.details.map(d => d.message).filter(Boolean);
-                if (detailMsgs.length > 0) {
-                    errorMessage = detailMsgs.join(' | ');
-                    extractedDetails = ` | Details: ${errorMessage}`;
-                }
-            }
+                String(normalized.errorCode || '').includes('ALREADY_UPDATING') ||
+                String(data?.codeDescription || '').includes('ALREADY_UPDATING') ||
+                String(data?.message || '').includes('ALREADY_UPDATING');
 
             console.warn(
-                `[Pluggy Create Item] HTTP ${resp.status} | Connector: ${body.connectorId} | User: ${req.currentUser} | Code: ${data?.code || data?.codeDescription || 'N/A'} | Message: ${data?.message || 'N/A'}${extractedDetails}`
+                `[Pluggy Create Item] HTTP ${resp.status} | Connector: ${body.connectorId} | User: ${req.currentUser} | Code: ${normalized.errorCode || 'N/A'} | Message: ${normalized.error || 'N/A'}`
             );
 
             return res.status(resp.status).json({
-                success: false,
-                error: alreadyUpdating
-                    ? 'Conexão já em andamento. Aguarde o webhook.'
-                    : errorMessage,
+                ...normalized,
+                error: alreadyUpdating ? 'Conexao ja em andamento. Aguarde alguns instantes.' : normalized.error,
+                retryable: normalized.retryable || alreadyUpdating,
             });
         }
 
         const oauthUrl =
-            data.oauthUrl ||
-            data.parameter?.oauthUrl ||
-            data.parameter?.data ||
-            data.userAction?.url ||
-            data.userAction?.attributes?.url ||
+            data?.oauthUrl ||
+            data?.parameter?.oauthUrl ||
+            data?.parameter?.data ||
+            data?.userAction?.url ||
+            data?.userAction?.attributes?.url ||
             null;
 
         return res.json({
             success: true,
             item: data,
             oauthUrl,
-            callbackUrl
+            callbackUrl,
         });
     } catch (err) {
-        return res.status(400).json({ success: false, error: err.message });
+        return res.status(400).json({
+            success: false,
+            error: err?.message || 'Falha ao criar conexao',
+            errorCode: 'CREATE_ITEM_REQUEST_INVALID',
+            retryable: false,
+            actionRequired: true,
+        });
     }
 });
 
@@ -470,17 +710,19 @@ router.post('/force-refresh/:id', async (req, res) => {
         });
 
         if (!refreshRes.ok) {
-            return res.status(502).json({ success: false, error: 'Falha ao iniciar atualização do item' });
+            return sendPluggyError(res, refreshRes, 'Falha ao iniciar atualizacao do item', 'FORCE_REFRESH_FAILED');
         }
 
+        const item = await readResponseBody(refreshRes);
         return res.status(202).json({
             success: true,
-            message: 'Sincronização iniciada!',
-            itemId: id
+            message: 'Sincronizacao iniciada',
+            itemId: id,
+            item,
         });
     } catch (err) {
         const mapped = mapItemOwnershipError(err);
-        return res.status(mapped.status).json({ success: false, error: mapped.message });
+        return res.status(mapped.status).json(mapped.body);
     }
 });
 
@@ -488,21 +730,34 @@ router.post('/sync', async (req, res) => {
     try {
         const { itemId, from, fullHistory = false, autoRefresh = false } = syncSchema.parse(req.body);
         const itemData = await ensureItemOwnership(itemId, req.currentUser);
+        const itemStateError = buildItemStateError(itemData);
+
+        if (itemStateError) {
+            return res.status(itemStateError.status).json(itemStateError.body);
+        }
+
+        if (String(itemData.status || '').toUpperCase() !== 'UPDATED') {
+            return res.status(409).json({
+                success: false,
+                error: 'Item ainda nao esta pronto para sincronizar.',
+                errorCode: 'ITEM_NOT_READY',
+                retryable: true,
+                actionRequired: false,
+                itemStatus: itemData.status || null,
+            });
+        }
 
         if (autoRefresh) {
-            pluggy.safeFetch(`${PLUGGY_API_URL}/items/${itemId}`, {
-                method: 'PATCH',
-                headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({}),
-            }).catch(() => null);
+            console.info(`[Pluggy Sync] Ignoring autoRefresh inside /sync for item ${itemId}; refresh must be explicit.`);
         }
 
         const accountsRes = await pluggy.safeFetch(`${PLUGGY_API_URL}/accounts?itemId=${itemId}`);
         if (!accountsRes.ok) {
-            return res.status(502).json({ success: false, error: 'Erro ao buscar contas do item' });
+            return sendPluggyError(res, accountsRes, 'Erro ao buscar contas do item', 'ACCOUNTS_FETCH_FAILED');
         }
 
-        const { results: accountsList = [] } = await accountsRes.json();
+        const accountsPayload = await readResponseBody(accountsRes);
+        const accountsList = Array.isArray(accountsPayload?.results) ? accountsPayload.results : [];
         const fromDate = from || (
             fullHistory
                 ? FULL_HISTORY_FROM_DATE
@@ -513,63 +768,52 @@ router.post('/sync', async (req, res) => {
             : MAX_TRANSACTION_PAGES_DEFAULT;
 
         const enrichedAccounts = [];
-        const CONCURRENT_ACCOUNTS = 3;
+        const accountErrors = [];
+        const concurrentAccounts = 3;
 
-        for (let i = 0; i < accountsList.length; i += CONCURRENT_ACCOUNTS) {
-            const batch = accountsList.slice(i, i + CONCURRENT_ACCOUNTS);
+        for (let i = 0; i < accountsList.length; i += concurrentAccounts) {
+            const batch = accountsList.slice(i, i + concurrentAccounts);
             const batchResults = await Promise.all(batch.map(async (account) => {
-                let allTx = [];
-                let page = 1;
-                let hasMore = true;
-
-                while (hasMore && page <= maxTransactionPages) {
-                    const params = new URLSearchParams({
+                try {
+                    const result = await enrichAccount(account, fromDate, maxTransactionPages);
+                    if (result.billError) accountErrors.push(result.billError);
+                    return result.account;
+                } catch (error) {
+                    accountErrors.push({
+                        stage: error.stage || 'account',
                         accountId: account.id,
-                        pageSize: TRANSACTIONS_PAGE_SIZE.toString(),
-                        page: page.toString(),
-                        from: fromDate,
+                        accountName: account.name || null,
+                        success: false,
+                        error: error.error || 'Erro ao sincronizar conta',
+                        errorCode: error.errorCode || 'ACCOUNT_SYNC_FAILED',
+                        retryable: error.retryable !== false,
+                        actionRequired: error.actionRequired === true,
                     });
 
-                    const txRes = await pluggy.safeFetch(`${PLUGGY_API_URL}/transactions?${params}`);
-                    const txData = txRes.ok ? await txRes.json() : { results: [], totalPages: page };
-                    allTx.push(...(txData.results || []));
-
-                    if (Number(txData.totalPages || 0) <= page) hasMore = false;
-                    page += 1;
+                    return {
+                        ...account,
+                        transactions: [],
+                        bills: [],
+                        truncatedByPageLimit: false,
+                        syncError: error.error || 'Erro ao sincronizar conta',
+                    };
                 }
-                const truncatedByPageLimit = hasMore;
-
-                let bills = [];
-                if (account.type === 'CREDIT') {
-                    const billsRes = await pluggy.safeFetch(`${PLUGGY_API_URL}/accounts/${account.id}/bills`);
-                    if (billsRes.ok) {
-                        const billsPayload = await billsRes.json();
-                        bills = billsPayload.results || [];
-                    }
-                    // LOG: Capturar datas brutas do Pluggy para debug
-                    console.log(`[Pluggy Sync] CREDIT Account: ${account.name || account.id} | creditData:`, JSON.stringify(account.creditData || 'N/A'));
-                    console.log(`[Pluggy Sync] balanceCloseDate: ${account.creditData?.balanceCloseDate || 'NULL'} | balanceDueDate: ${account.creditData?.balanceDueDate || 'NULL'}`);
-                    if (bills.length > 0) {
-                        console.log(`[Pluggy Sync] Bills count: ${bills.length} | CurrentBill dueDate: ${bills[0]?.dueDate || 'NULL'} | closeDate: ${bills[0]?.date || bills[0]?.closeDate || 'NULL'}`);
-                    }
-                }
-
-                return { ...account, transactions: allTx, bills, truncatedByPageLimit };
             }));
 
             enrichedAccounts.push(...batchResults);
 
-            if (i + CONCURRENT_ACCOUNTS < accountsList.length) {
-                // Pequena pausa entre os lotes para aliviar a API
-                await new Promise(resolve => setTimeout(resolve, 300));
+            if (i + concurrentAccounts < accountsList.length) {
+                await new Promise((resolve) => setTimeout(resolve, 300));
             }
         }
 
         return res.json({
             success: true,
+            partial: accountErrors.length > 0,
+            accountErrors,
             itemStatus: itemData.status,
             lastUpdatedAt: itemData.updatedAt,
-            isRefreshing: itemData.status === 'UPDATING' || autoRefresh,
+            isRefreshing: false,
             connector: itemData.connector || null,
             accounts: enrichedAccounts,
             totalTransactions: enrichedAccounts.reduce((sum, account) => sum + (account.transactions?.length || 0), 0),
@@ -582,10 +826,7 @@ router.post('/sync', async (req, res) => {
         });
     } catch (err) {
         const mapped = mapItemOwnershipError(err);
-        return res.status(mapped.status).json({
-            success: false,
-            error: mapped.message || 'Erro ao buscar dados sincronizados.'
-        });
+        return res.status(mapped.status).json(mapped.body);
     }
 });
 
@@ -593,11 +834,17 @@ router.get('/items', async (req, res) => {
     try {
         const resp = await pluggy.safeFetch(`${PLUGGY_API_URL}/items?clientUserId=${req.currentUser}`);
         if (!resp.ok) {
-            return res.status(502).json({ success: false, error: 'Erro ao listar items' });
+            return sendPluggyError(res, resp, 'Erro ao listar items', 'ITEMS_LIST_FAILED');
         }
-        return res.json(await resp.json());
+        return res.json(await readResponseBody(resp));
     } catch (err) {
-        return res.status(502).json({ success: false, error: 'Erro ao listar items' });
+        return res.status(502).json({
+            success: false,
+            error: err?.message || 'Erro ao listar items',
+            errorCode: 'ITEMS_LIST_FAILED',
+            retryable: true,
+            actionRequired: false,
+        });
     }
 });
 
@@ -608,7 +855,7 @@ router.get('/items/:id', async (req, res) => {
         return res.json({ success: true, item });
     } catch (err) {
         const mapped = mapItemOwnershipError(err);
-        return res.status(mapped.status).json({ success: false, error: mapped.message });
+        return res.status(mapped.status).json(mapped.body);
     }
 });
 
@@ -618,14 +865,25 @@ router.delete('/items/:id', async (req, res) => {
         await ensureItemOwnership(id, req.currentUser);
 
         const deleteRes = await pluggy.safeFetch(`${PLUGGY_API_URL}/items/${id}`, { method: 'DELETE' });
+        if (deleteRes.status === 404) {
+            return res.json({
+                success: true,
+                message: 'Item ja estava desconectado',
+                itemId: id,
+            });
+        }
         if (!deleteRes.ok) {
-            return res.status(502).json({ success: false, error: 'Falha ao desconectar item' });
+            return sendPluggyError(res, deleteRes, 'Falha ao desconectar item', 'ITEM_DELETE_FAILED');
         }
 
-        return res.json({ success: true, message: 'Item desconectado com sucesso' });
+        return res.json({
+            success: true,
+            message: 'Item desconectado com sucesso',
+            itemId: id,
+        });
     } catch (err) {
         const mapped = mapItemOwnershipError(err);
-        return res.status(mapped.status).json({ success: false, error: mapped.message });
+        return res.status(mapped.status).json(mapped.body);
     }
 });
 
